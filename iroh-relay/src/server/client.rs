@@ -805,6 +805,50 @@ mod tests {
         Ok(())
     }
 
+    /// ember: a client that takes the relay's packets slower than they come gets each soon or not at all; none waits
+    /// in the relay for seconds. 2026-10-30: a Mac on a lossy mobile line (its TCP to the Beijing relay moving 20 KB/s)
+    /// downloading from a station had a 15.7 s round trip through that relay, the station's packets queued in it.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn test_slow_client_packets_wait_briefly() -> Result {
+        const SENT: usize = 100;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7u64);
+        let slow = SecretKey::from_bytes(&rng.random()).public();
+        let station = SecretKey::from_bytes(&rng.random()).public();
+
+        // As in production: the default queue depth, a socket that holds a few packets.
+        let (server, client) = tokio::io::duplex(4096);
+        let config = Config::new(
+            OnDisconnectGuard::empty(slow),
+            ServerRelayedStream::test(server),
+            ProtocolVersion::V2,
+        );
+        let mut conn = Conn::test(client, ProtocolVersion::V2);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        clients.register(config, metrics.clone());
+
+        let start = tokio::time::Instant::now();
+        for _ in 0..SENT {
+            clients.send_packet(slow, Datagrams::from(&[0u8; 1200][..]), station, &metrics)?;
+        }
+
+        // The client takes one packet every 100 ms.
+        let mut waits = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), conn.next()).await {
+            frame.anyerr()?;
+            waits.push(start.elapsed());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let longest = waits.iter().max().copied().unwrap_or_default();
+        info!(got = waits.len(), ?longest);
+        assert!(!waits.is_empty(), "nothing came");
+        assert!(longest <= Duration::from_secs(1), "a packet waited {longest:?}");
+
+        clients.shutdown().await;
+        Ok(())
+    }
+
     /// Test for versioned protocol: v1 client should receive V1Health frame.
     #[tokio::test]
     #[traced_test]

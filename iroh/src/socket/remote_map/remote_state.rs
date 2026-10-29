@@ -168,7 +168,16 @@ struct State {
 
     /// The path selector used to pick the preferred path among the candidates.
     path_selector: Arc<dyn PathSelector>,
+
+    /// ember: the datagrams last sent to every known path while none was selected (a connection's Initial
+    /// packets), and how to send them. Addresses that Address Lookup finds afterwards get them at once, rather than
+    /// only with QUIC's next retransmit (1 s, then 3 s, after the first). A copy the remote has had already is a
+    /// duplicate packet, which it drops.
+    unanswered: Option<(Box<TransportsSender>, Vec<OwnedTransmit>)>,
 }
+
+/// ember: how many of the last datagrams sent before a path was selected are kept for [`State::unanswered`].
+const UNANSWERED_KEPT: usize = 4;
 
 impl RemoteStateActor {
     #[allow(clippy::too_many_arguments)]
@@ -201,6 +210,7 @@ impl RemoteStateActor {
                 pending_open_paths: VecDeque::new(),
                 address_lookup_stream: None,
                 path_selector,
+                unanswered: None,
             },
         }
     }
@@ -315,7 +325,7 @@ impl RemoteStateActor {
                     self.trigger_holepunching();
                 }
                 Some(item) = maybe_next(self.state.address_lookup_stream.as_mut()), if self.state.address_lookup_stream.is_some() => {
-                    self.state.handle_address_lookup_item(item);
+                    self.state.handle_address_lookup_item(item).await;
                 }
                 _ = check_connections.tick() => {
                     self.check_connections();
@@ -658,6 +668,8 @@ impl RemoteStateActor {
             && self.state.selected_path.as_ref() != Some(&addr)
         {
             let prev_remote = self.state.selected_path.replace(addr.clone());
+            // ember: a path works; what was kept for addresses found later is not needed.
+            self.state.unanswered = None;
             event!(
                 target: "iroh::_events::path::selected",
                 Level::DEBUG,
@@ -811,6 +823,17 @@ impl State {
                 paths = ?self.paths.addrs().collect::<Vec<_>>(),
                 "sending datagram to all known paths",
             );
+            // ember: kept for addresses found later (see `unanswered`).
+            match &mut self.unanswered {
+                Some((kept_sender, kept)) => {
+                    *kept_sender = sender.clone();
+                    if kept.len() == UNANSWERED_KEPT {
+                        kept.remove(0);
+                    }
+                    kept.push(transmit.clone());
+                }
+                None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
+            }
             if self.paths.is_empty() {
                 warn!("Cannot send datagrams: No paths to remote endpoint known");
             }
@@ -883,7 +906,7 @@ impl State {
     ///
     /// All address lookup results end up being sent here. It takes care of updating the
     /// [`RemotePathState`] with the results.
-    fn handle_address_lookup_item(
+    async fn handle_address_lookup_item(
         &mut self,
         item: Option<Result<AddressLookupItem, AddressLookupFailed>>,
     ) {
@@ -911,9 +934,42 @@ impl State {
                     let source = Source::AddressLookup {
                         name: item.provenance().to_string(),
                     };
-                    let addrs =
-                        to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs);
-                    self.paths.insert_multiple(addrs, source);
+                    let addrs: Vec<_> =
+                        to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs)
+                            .collect();
+                    let known: BTreeSet<transports::Addr> = self.paths.addrs().cloned().collect();
+                    self.paths.insert_multiple(addrs.iter().cloned(), source);
+                    let found: Vec<_> = addrs
+                        .into_iter()
+                        .filter(|a| matches!(a, transports::Addr::Ip(_)) && !known.contains(a))
+                        .collect();
+                    self.send_unanswered(&found).await;
+                }
+            }
+        }
+    }
+
+    /// ember: sends the datagrams kept in [`Self::unanswered`] to addresses just found, while no path is selected
+    /// (once one is, they are dropped: the connection is under way).
+    async fn send_unanswered(&mut self, found: &[transports::Addr]) {
+        if self.selected_path.is_some() {
+            self.unanswered = None;
+            return;
+        }
+        let Some((sender, kept)) = self.unanswered.as_mut() else {
+            return;
+        };
+        for addr in found {
+            trace!(?addr, count = kept.len(), "sending unanswered datagrams to a newly found address");
+            for transmit in kept.iter() {
+                if let Err(err) = send_datagram(
+                    sender,
+                    transports::FourTuple::from_remote(addr.clone()),
+                    transmit.clone(),
+                )
+                .await
+                {
+                    debug!(?addr, "failed to send datagram: {err:#}");
                 }
             }
         }

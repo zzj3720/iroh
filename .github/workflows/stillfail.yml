@@ -1,0 +1,25 @@
+# still.fail's branch of iroh: its tests, on every push and pull request. Upstream's workflows are left out (they run on
+# n0's own runners).
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  iroh:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: iroh's tests
+        run: cargo test -p iroh --lib --features test-utils
+      - name: the browser's build (wasm32, as still.fail's iroh-wasm)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add wasm32-unknown-unknown
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p iroh --target wasm32-unknown-unknown --no-default-features --features tls-ring

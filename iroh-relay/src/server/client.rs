@@ -44,7 +44,16 @@ pub(super) struct Packet {
     src: EndpointId,
     /// The data packet bytes.
     data: Datagrams,
+    /// ember: when it was put in the client's queue.
+    queued: tokio::time::Instant,
 }
+
+/// ember: the longest a packet waits in a client's queue before it is dropped instead of sent. The relay forwards
+/// packets: one it holds for seconds behind a client that takes them slowly is no use to it, and the sender, never
+/// told of a loss, keeps sending (2026-10-30: a 15.7 s round trip through the Beijing relay to a Mac on a lossy mobile
+/// line). Dropped, the sender's congestion control slows to what the client takes. About a round trip of the farthest
+/// way still.fail's relays carry.
+const MAX_PACKET_WAIT: Duration = Duration::from_millis(200);
 
 /// Configuration for a client connection.
 ///
@@ -206,7 +215,11 @@ impl Client {
         src: EndpointId,
         data: Datagrams,
     ) -> Result<(), TrySendError<Packet>> {
-        self.packet_queue.try_send(Packet { src, data })
+        self.packet_queue.try_send(Packet {
+            src,
+            data,
+            queued: tokio::time::Instant::now(),
+        })
     }
 
     pub(super) fn try_send_peer_gone(
@@ -417,6 +430,11 @@ where
                 // Second priority, sending regular packets
                 packet = self.packet_send_queue.recv() => {
                     let packet = packet.ok_or_else(|| e!(RunError::HandleDropped))?;
+                    if packet.queued.elapsed() > MAX_PACKET_WAIT {
+                        trace!("packet waited too long, dropping");
+                        self.metrics.send_packets_dropped.inc();
+                        continue;
+                    }
                     self.send_packet(packet)
                         .await
                         .map_err(|err| e!(RunError::PacketSend, err))?;
@@ -678,6 +696,7 @@ mod tests {
         let packet = Packet {
             src: endpoint_id,
             data: Datagrams::from(&data[..]),
+            queued: tokio::time::Instant::now(),
         };
         send_queue_s
             .send(packet.clone())
@@ -835,7 +854,8 @@ mod tests {
 
         // The client takes one packet every 100 ms.
         let mut waits = Vec::new();
-        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), conn.next()).await {
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(2), conn.next()).await
+        {
             frame.anyerr()?;
             waits.push(start.elapsed());
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -843,7 +863,10 @@ mod tests {
         let longest = waits.iter().max().copied().unwrap_or_default();
         info!(got = waits.len(), ?longest);
         assert!(!waits.is_empty(), "nothing came");
-        assert!(longest <= Duration::from_secs(1), "a packet waited {longest:?}");
+        assert!(
+            longest <= Duration::from_secs(1),
+            "a packet waited {longest:?}"
+        );
 
         clients.shutdown().await;
         Ok(())

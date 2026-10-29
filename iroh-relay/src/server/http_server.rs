@@ -526,6 +526,13 @@ impl ServerBuilder {
                         res = listener.accept() => match res {
                             Ok((stream, peer_addr)) => {
                                 debug!("connection opened from {peer_addr}");
+                                // ember: what the client has yet to be sent waits in its queue, where it is dropped
+                                // once old (client.rs, MAX_PACKET_WAIT), not in the socket's buffer (up to 4 MB),
+                                // where it would wait as long as the client takes to read it.
+                                #[cfg(target_os = "linux")]
+                                if let Err(err) = socket2::SockRef::from(&stream).set_tcp_notsent_lowat(NOTSENT_LOWAT) {
+                                    debug!("TCP_NOTSENT_LOWAT not set: {err}");
+                                }
                                 let tls_config = tls_config.clone();
                                 let service = service.clone();
                                 // spawn a task to handle the connection
@@ -556,6 +563,10 @@ impl ServerBuilder {
         })
     }
 }
+
+/// ember: the most a client's socket holds that it has not sent yet: a dozen packets.
+#[cfg(target_os = "linux")]
+const NOTSENT_LOWAT: u32 = 16 * 1024;
 
 /// The hyper Service that serves the actual relay endpoints.
 ///

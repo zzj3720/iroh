@@ -2522,6 +2522,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "simdutf8",
+ "socket2",
  "strum",
  "test-strategy",
  "time",

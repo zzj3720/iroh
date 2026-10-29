@@ -4,3 +4,5 @@ pub mod common;
 pub mod handshake;
 pub mod relay;
 pub mod streams;
+#[cfg(not(wasm_browser))]
+pub mod udp;

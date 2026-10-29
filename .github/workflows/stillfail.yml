@@ -19,6 +19,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: iroh's tests
         run: cargo test -p iroh --lib --features test-utils
+      - name: iroh-relay's tests
+        run: cargo test -p iroh-relay --lib --features server,test-utils
       - name: the browser's build (wasm32, as still.fail's iroh-wasm)
         if: matrix.os == 'ubuntu-latest'
         run: |

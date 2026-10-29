@@ -42,12 +42,18 @@ use crate::{
         CLIENT_AUTH_HEADER, ProtocolVersion, RELAY_PATH, SUPPORTED_WEBSOCKET_VERSION,
         WEBSOCKET_UPGRADE_PROTOCOL,
     },
-    protos::{handshake, relay::MAX_FRAME_SIZE, streams::WsBytesFramed},
+    protos::{
+        handshake,
+        relay::MAX_FRAME_SIZE,
+        streams::WsBytesFramed,
+        udp::{Token, UDP_HEADER, offer_value},
+    },
     server::{
         ClientRateLimit,
         client::Config,
         metrics::Metrics,
         streams::{MaybeTlsStream, RateLimited, RelayedStream},
+        udp::UdpRelay,
     },
 };
 
@@ -142,6 +148,11 @@ impl Server {
     /// Returns the local address of this server.
     pub(super) fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// ember: the address of the relay's UDP way, if it has one.
+    pub(super) fn udp_addr(&self) -> Option<SocketAddr> {
+        self.service.0.udp.get().map(|udp| udp.local_addr())
     }
 
     /// Returns the [`RelayService`] driving this server.
@@ -354,6 +365,8 @@ pub(super) struct ServerBuilder {
     access: Arc<dyn DynAccessControl>,
     metrics: Option<Arc<Metrics>>,
     establish_timeout: Duration,
+    /// ember: where the relay's UDP way binds, off if `None`.
+    udp_bind_addr: Option<SocketAddr>,
 }
 
 impl ServerBuilder {
@@ -369,7 +382,14 @@ impl ServerBuilder {
             access: Arc::new(AllowAll),
             metrics: None,
             establish_timeout: ESTABLISH_TIMEOUT,
+            udp_bind_addr: None,
         }
+    }
+
+    /// ember: binds the relay's UDP way at `addr`.
+    pub(super) fn udp_bind_addr(mut self, addr: SocketAddr) -> Self {
+        self.udp_bind_addr = Some(addr);
+        self
     }
 
     /// Sets the metrics collector.
@@ -450,6 +470,23 @@ impl ServerBuilder {
             self.access,
             self.metrics.unwrap_or_default(),
         );
+        if let Some(addr) = self.udp_bind_addr {
+            let udp = UdpRelay::bind(
+                addr,
+                service.0.clients.clone(),
+                service.0.key_cache.clone(),
+                service.0.rate_limit.subscribe(),
+                service.0.metrics.clone(),
+            )
+            .await
+            .map_err(|err| e!(super::SpawnError::BindUdp { addr }, err))?;
+            info!("relay: udp on port {}", udp.port());
+            service
+                .0
+                .udp
+                .set(Arc::new(udp))
+                .expect("set once, as the service is made");
+        }
 
         let addr = self.addr;
         let tls_config = self.tls_config;
@@ -536,6 +573,8 @@ struct Inner {
     key_cache: KeyCache,
     access: Arc<dyn DynAccessControl>,
     metrics: Arc<Metrics>,
+    /// ember: the relay's UDP way, if it has one.
+    udp: std::sync::OnceLock<Arc<UdpRelay>>,
 }
 
 #[stack_error(derive, add_meta)]
@@ -621,6 +660,14 @@ impl RelayServiceWithNotify {
                 })
             })?;
 
+        // ember: the UDP way offered to a client that asks for it, its token taken once the connection is authorized.
+        let udp = self.service.0.udp.get().filter(|_| {
+            req.headers()
+                .get(UDP_HEADER)
+                .is_some_and(|v| v.as_bytes() == b"1")
+        });
+        let udp_offer = udp.map(|udp| (udp.port(), UdpRelay::new_token()));
+
         // Setup a future that will eventually receive the upgraded
         // connection and talk a new protocol, and spawn the future
         // into the runtime.
@@ -637,7 +684,12 @@ impl RelayServiceWithNotify {
                         if let Err(err) = this
                             .service
                             .0
-                            .relay_connection_handler(upgraded, parts, protocol_version)
+                            .relay_connection_handler(
+                                upgraded,
+                                parts,
+                                protocol_version,
+                                udp_offer.map(|(_, token)| token),
+                            )
                             .await
                         {
                             warn!("error accepting upgraded connection: {err:#}",);
@@ -655,10 +707,14 @@ impl RelayServiceWithNotify {
             .instrument(info_span!("handler"))
         });
 
+        let mut response = self.build_response();
+        if let Some((port, token)) = udp_offer {
+            response = response.header(UDP_HEADER, offer_value(port, &token));
+        }
+
         // Now return a 101 Response saying we agree to the upgrade to the
         // websocket upgrade protocol
-        Ok(self
-            .build_response()
+        Ok(response
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .header(
                 UPGRADE,
@@ -821,6 +877,7 @@ impl Inner {
         upgraded: Upgraded,
         request_parts: http::request::Parts,
         protocol_version: ProtocolVersion,
+        udp_token: Option<Token>,
     ) -> Result<(), ConnectionHandlerError> {
         debug!("relay_connection upgraded");
         let (io, read_buf) = downcast_upgrade(upgraded)?;
@@ -828,7 +885,8 @@ impl Inner {
             return Err(e!(ConnectionHandlerError::BufferNotEmpty { buf: read_buf }));
         }
 
-        self.accept(io, request_parts, protocol_version).await?;
+        self.accept(io, request_parts, protocol_version, udp_token)
+            .await?;
         Ok(())
     }
 
@@ -847,6 +905,7 @@ impl Inner {
         io: MaybeTlsStream,
         request_parts: http::request::Parts,
         protocol_version: ProtocolVersion,
+        udp_token: Option<Token>,
     ) -> Result<(), AcceptError> {
         trace!("accept: start");
 
@@ -889,6 +948,9 @@ impl Inner {
         let mut client_conn_builder = Config::new(guard, io, protocol_version);
         client_conn_builder.write_timeout = self.write_timeout;
         client_conn_builder.rate_limited = Some(limited_watcher);
+        if let (Some(token), Some(udp)) = (udp_token, self.udp.get()) {
+            client_conn_builder.udp = Some(udp.register(token, request.endpoint_id()));
+        }
         trace!(endpoint_id = %request.endpoint_id().fmt_short(), "create client");
 
         // build and register client, starting up read & write loops for the client
@@ -930,6 +992,7 @@ impl RelayService {
             key_cache,
             access,
             metrics,
+            udp: std::sync::OnceLock::new(),
         }))
     }
 
@@ -1503,6 +1566,7 @@ mod tests {
                 MaybeTlsStream::Test(rw_a),
                 Request::new(()).into_parts().0,
                 Default::default(),
+                None,
             )
             .await
         });
@@ -1519,6 +1583,7 @@ mod tests {
                 MaybeTlsStream::Test(rw_b),
                 Request::new(()).into_parts().0,
                 Default::default(),
+                None,
             )
             .await
         });
@@ -1615,6 +1680,7 @@ mod tests {
                 MaybeTlsStream::Test(rw_a),
                 Request::new(()).into_parts().0,
                 Default::default(),
+                None,
             )
             .await
         });
@@ -1631,6 +1697,7 @@ mod tests {
                 MaybeTlsStream::Test(rw_b),
                 Request::new(()).into_parts().0,
                 Default::default(),
+                None,
             )
             .await
         });
@@ -1687,6 +1754,7 @@ mod tests {
                 MaybeTlsStream::Test(new_rw_b),
                 Request::new(()).into_parts().0,
                 Default::default(),
+                None,
             )
             .await
         });

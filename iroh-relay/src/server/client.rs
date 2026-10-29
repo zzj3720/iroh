@@ -33,6 +33,7 @@ use crate::{
         clients::Clients,
         metrics::Metrics,
         streams::{RecvError as RelayRecvError, RelayedStream, SendError as RelaySendError},
+        udp::UdpRegistration,
     },
 };
 
@@ -69,6 +70,8 @@ pub struct Config<S> {
     /// [`Status::RateLimited`] message when the rate-limited counter first
     /// becomes non-zero.
     pub(crate) rate_limited: Option<watch::Receiver<u64>>,
+    /// ember: the connection's hold on the relay's UDP way, if it took it.
+    pub(crate) udp: Option<UdpRegistration>,
 }
 
 impl<S> Config<S> {
@@ -87,6 +90,7 @@ impl<S> Config<S> {
             write_timeout: SERVER_WRITE_TIMEOUT,
             channel_capacity: PER_CLIENT_SEND_QUEUE_DEPTH,
             rate_limited: None,
+            udp: None,
         }
     }
 }
@@ -132,6 +136,7 @@ impl Client {
             channel_capacity,
             protocol_version,
             rate_limited,
+            udp,
         } = config;
         let endpoint_id = guard.endpoint_id;
         let connection_id = guard.connection_id;
@@ -152,6 +157,7 @@ impl Client {
             protocol_version,
             rate_limited,
             metrics,
+            udp,
         };
 
         // start io loop
@@ -337,6 +343,8 @@ struct Actor<S> {
     /// Optional signal counting how often the connection has been rate-limited.
     rate_limited: Option<watch::Receiver<u64>>,
     metrics: Arc<Metrics>,
+    /// ember: the relay's UDP way to this client, if it took it.
+    udp: Option<UdpRegistration>,
 }
 
 impl<S> Actor<S>
@@ -472,6 +480,10 @@ where
 
     async fn send_packet(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
         trace!("send packet");
+        if let Some(udp) = &mut self.udp {
+            udp.send(&packet.src, &packet.data, &self.metrics);
+            return Ok(());
+        }
         match self.send_raw(packet).await {
             Ok(()) => {
                 self.metrics.send_packets_sent.inc();
@@ -650,6 +662,7 @@ mod tests {
             protocol_version: ProtocolVersion::V2,
             rate_limited: None,
             metrics,
+            udp: None,
         };
 
         let done = CancellationToken::new();

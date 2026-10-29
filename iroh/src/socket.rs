@@ -179,6 +179,9 @@ pub(crate) struct Options {
     /// Proxy configuration.
     pub(crate) proxy_url: Option<Url>,
 
+    /// ember: whether relays are asked for their UDP way.
+    pub(crate) relay_udp: bool,
+
     /// TLS configuration for HTTPS and non-iroh-QUIC connections.
     pub(crate) tls_config: rustls::ClientConfig,
 
@@ -884,6 +887,7 @@ impl EndpointInner {
             #[cfg(not(wasm_browser))]
             dns_resolver,
             proxy_url,
+            relay_udp,
             server_config,
             tls_config,
             metrics,
@@ -936,6 +940,7 @@ impl EndpointInner {
             #[cfg(not(wasm_browser))]
             dns_resolver: dns_resolver.clone(),
             proxy_url: proxy_url.clone(),
+            relay_udp,
             ipv6_reported: ipv6_reported.clone(),
             tls_config: tls_config.clone(),
             metrics: metrics.socket.clone(),
@@ -2180,6 +2185,7 @@ mod tests {
             ],
             secret_key,
             proxy_url: None,
+            relay_udp: false,
             dns_resolver: DnsResolver::new(),
             server_config,
             tls_config: CaTlsConfig::default()
@@ -2599,6 +2605,7 @@ mod tests {
             address_lookup_user_data: None,
             dns_resolver,
             proxy_url: None,
+            relay_udp: false,
             server_config,
             tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())

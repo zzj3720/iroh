@@ -107,6 +107,12 @@ pub struct Metrics {
     // TODO: only important stat that we cannot track right now
     // pub average_queue_duration:
     //
+    /// ember: bytes of datagrams received over the relay's UDP way (also counted in `bytes_recv`).
+    pub udp_bytes_recv: Counter,
+
+    /// ember: bytes of datagrams sent over the relay's UDP way (also counted in `bytes_sent`).
+    pub udp_bytes_sent: Counter,
+
     /// Number of incoming QAD connections.
     ///
     /// After completion, each is counted in either `qad_incoming_error` or `qad_connections`.

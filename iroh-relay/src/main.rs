@@ -148,6 +148,12 @@ struct Config {
     metrics_bind_addr: Option<SocketAddr>,
     /// The capacity of the key cache.
     key_cache_capacity: Option<usize>,
+    /// ember: the socket address of the relay's UDP way, off if not set.
+    ///
+    /// Clients that ask for it send and receive their datagrams over UDP on it, the WebSocket still their
+    /// connection, and carrying them whenever UDP does not go through. Its port must be reachable at the address the
+    /// clients reach the relay's HTTPS at.
+    udp_bind_addr: Option<SocketAddr>,
     /// Access control for relaying connections.
     ///
     /// This controls which endpoints are allowed to relay connections, other endpoints are not controlled by this.
@@ -358,6 +364,7 @@ impl Default for Config {
             enable_metrics: cfg_defaults::enable_metrics(),
             metrics_bind_addr: None,
             key_cache_capacity: Default::default(),
+            udp_bind_addr: None,
             access: AccessConfig::Everyone,
         }
     }
@@ -764,6 +771,7 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
         relay_config.tls = tls_config;
         relay_config.limits = limits;
         relay_config.key_cache_capacity = cfg.key_cache_capacity;
+        relay_config.udp_bind_addr = cfg.udp_bind_addr;
         relay_config.access = cfg.access.clone().try_into()?;
         Some(relay_config)
     } else {

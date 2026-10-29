@@ -69,6 +69,7 @@ pub(crate) mod resolver;
 pub mod streams;
 #[cfg(feature = "test-utils")]
 pub mod testing;
+mod udp;
 
 pub use self::{
     http_server::{Handlers, RelayService},
@@ -144,6 +145,10 @@ pub struct RelayConfig {
     pub key_cache_capacity: Option<usize>,
     /// Access control for incoming connections.
     pub access: Arc<dyn DynAccessControl>,
+    /// ember: the socket address of the relay's UDP way (protos/udp.rs), off if `None`.
+    ///
+    /// Clients that ask for it send and receive their datagrams over UDP here, their WebSocket still the connection.
+    pub udp_bind_addr: Option<SocketAddr>,
 }
 
 impl RelayConfig {
@@ -159,6 +164,7 @@ impl RelayConfig {
             limits: Limits::default(),
             key_cache_capacity: None,
             access: Arc::new(AllowAll),
+            udp_bind_addr: None,
         }
     }
 }
@@ -624,6 +630,8 @@ pub struct Server {
     https_addr: Option<SocketAddr>,
     /// The address of the QUIC server, if configured.
     quic_addr: Option<SocketAddr>,
+    /// ember: the address of the relay's UDP way, if configured.
+    udp_addr: Option<SocketAddr>,
     /// Handle to the relay server.
     relay_handle: Option<http_server::ServerHandle>,
     /// Handle to the relay service for runtime control.
@@ -658,6 +666,11 @@ pub enum SpawnError {
     NoLocalAddr { source: std::io::Error },
     #[error("Failed to bind server socket to {addr}")]
     BindTcpListener {
+        source: std::io::Error,
+        addr: SocketAddr,
+    },
+    #[error("Failed to bind the relay's UDP socket to {addr}")]
+    BindUdp {
         source: std::io::Error,
         addr: SocketAddr,
     },
@@ -740,6 +753,9 @@ impl Server {
                     .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
                 if let Some(cfg) = relay_config.limits.client_rx {
                     builder = builder.client_rx_ratelimit(cfg);
+                }
+                if let Some(addr) = relay_config.udp_bind_addr {
+                    builder = builder.udp_bind_addr(addr);
                 }
                 let (http_addr, tls_config) = match relay_config.tls {
                     Some(tls_config) => {
@@ -837,6 +853,7 @@ impl Server {
         let relay_addr = relay_server.as_ref().map(|srv| srv.addr());
         let relay_handle = relay_server.as_ref().map(|srv| srv.handle());
         let relay_service = relay_server.as_ref().map(|srv| srv.service().clone());
+        let udp_addr = relay_server.as_ref().and_then(|srv| srv.udp_addr());
 
         let quic_server = match config.quic {
             Some(quic_config) => {
@@ -863,6 +880,7 @@ impl Server {
             http_addr: http_addr.or(relay_addr),
             https_addr: http_addr.and(relay_addr),
             quic_addr,
+            udp_addr,
             relay_handle,
             relay_service,
             quic_handle,
@@ -914,6 +932,11 @@ impl Server {
     /// The socket address the QUIC server is listening on.
     pub fn quic_addr(&self) -> Option<SocketAddr> {
         self.quic_addr
+    }
+
+    /// ember: the socket address the relay's UDP way is on.
+    pub fn udp_addr(&self) -> Option<SocketAddr> {
+        self.udp_addr
     }
 
     /// Get the server's https [`RelayUrl`].
@@ -1489,6 +1512,132 @@ mod tests {
             panic!("client_c received unexpected message {res:?}");
         }
 
+        Ok(())
+    }
+
+    /// ember: a relay with a UDP way: the datagrams of clients that took it go over UDP only, a client that did not
+    /// ask for it is still relayed (by its WebSocket), and a transmit of several segments arrives as each.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_relay_udp_way() -> Result<()> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let client_config = CaTlsConfig::default()
+            .client_config(default_provider())
+            .unwrap();
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.key_cache_capacity = Some(1024);
+        relay.udp_bind_addr = Some((Ipv4Addr::LOCALHOST, 0).into());
+        let server = Server::spawn(ServerConfig {
+            relay: Some(relay),
+            quic: None,
+            metrics_addr: None,
+        })
+        .await?;
+        assert!(server.udp_addr().is_some());
+        let relay_url: RelayUrl = format!("http://{}", server.http_addr().unwrap()).parse()?;
+        let metrics = server.metrics().server.clone();
+
+        let a_secret_key = SecretKey::from_bytes(&rng.random());
+        let a_key = a_secret_key.public();
+        let b_secret_key = SecretKey::from_bytes(&rng.random());
+        let b_key = b_secret_key.public();
+        let c_secret_key = SecretKey::from_bytes(&rng.random());
+        let c_key = c_secret_key.public();
+        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, dns_resolver())
+            .tls_client_config(client_config.clone())
+            .udp(true)
+            .connect()
+            .await?;
+        let mut client_b = ClientBuilder::new(relay_url.clone(), b_secret_key, dns_resolver())
+            .tls_client_config(client_config.clone())
+            .udp(true)
+            .connect()
+            .await?;
+        let mut client_c = ClientBuilder::new(relay_url.clone(), c_secret_key, dns_resolver())
+            .tls_client_config(client_config)
+            .connect()
+            .await?;
+
+        // Over UDP only: what the relay got and gave is all UDP's (the first ones dropped until b's hello came).
+        let msg = Datagrams::from("a to b");
+        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
+        assert!(
+            matches!(&res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if *remote_endpoint_id == a_key && datagrams.contents == msg.contents),
+            "{res:?}"
+        );
+        assert!(metrics.udp_bytes_recv.get() > 0);
+        assert_eq!(metrics.udp_bytes_recv.get(), metrics.bytes_recv.get());
+        assert_eq!(metrics.udp_bytes_sent.get(), metrics.bytes_sent.get());
+
+        // Three segments of one transmit: three datagrams over UDP.
+        let sent = metrics.udp_bytes_sent.get();
+        client_a
+            .send(ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: b_key,
+                datagrams: Datagrams {
+                    ecn: None,
+                    segment_size: std::num::NonZeroU16::new(4),
+                    contents: bytes::Bytes::from_static(b"aaaabbbbcc"),
+                },
+            })
+            .await?;
+        let mut got = Vec::new();
+        while got.len() < 3 {
+            let res = tokio::time::timeout(Duration::from_secs(5), client_b.next())
+                .await
+                .expect("datagram in time")
+                .expect("stream finished")?;
+            if let RelayToClientMsg::Datagrams { datagrams, .. } = res {
+                got.push(datagrams.contents);
+            }
+        }
+        assert_eq!(got, vec!["aaaa", "bbbb", "cc"]);
+        assert_eq!(metrics.udp_bytes_sent.get(), sent + 10);
+
+        // A client without UDP is relayed by its WebSocket, to and from one with it.
+        let udp_recv = metrics.udp_bytes_recv.get();
+        let msg = Datagrams::from("c to a");
+        let res = try_send_recv(&mut client_c, &mut client_a, a_key, msg.clone()).await?;
+        assert!(
+            matches!(res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if remote_endpoint_id == c_key && datagrams.contents == msg.contents)
+        );
+        assert_eq!(metrics.udp_bytes_recv.get(), udp_recv);
+        let msg = Datagrams::from("a to c");
+        let res = try_send_recv(&mut client_a, &mut client_c, c_key, msg.clone()).await?;
+        assert!(
+            matches!(res, RelayToClientMsg::Datagrams { remote_endpoint_id, datagrams } if remote_endpoint_id == a_key && datagrams == msg)
+        );
+
+        Ok(())
+    }
+
+    /// ember: a relay without a UDP way relays a client that asks for one by its WebSocket.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_relay_udp_not_offered() -> Result<()> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1u64);
+        let client_config = CaTlsConfig::default()
+            .client_config(default_provider())
+            .unwrap();
+        let server = spawn_local_relay().await?;
+        assert!(server.udp_addr().is_none());
+        let relay_url: RelayUrl = format!("http://{}", server.http_addr().unwrap()).parse()?;
+        let a_secret_key = SecretKey::from_bytes(&rng.random());
+        let b_secret_key = SecretKey::from_bytes(&rng.random());
+        let b_key = b_secret_key.public();
+        let mut client_a = ClientBuilder::new(relay_url.clone(), a_secret_key, dns_resolver())
+            .tls_client_config(client_config.clone())
+            .udp(true)
+            .connect()
+            .await?;
+        let mut client_b = ClientBuilder::new(relay_url, b_secret_key, dns_resolver())
+            .tls_client_config(client_config)
+            .udp(true)
+            .connect()
+            .await?;
+        let msg = Datagrams::from("hello");
+        let res = try_send_recv(&mut client_a, &mut client_b, b_key, msg.clone()).await?;
+        assert!(matches!(res, RelayToClientMsg::Datagrams { datagrams, .. } if datagrams == msg));
         Ok(())
     }
 

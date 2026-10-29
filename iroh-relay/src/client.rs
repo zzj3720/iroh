@@ -40,6 +40,8 @@ pub(crate) mod streams;
 #[cfg(not(wasm_browser))]
 mod tls;
 #[cfg(not(wasm_browser))]
+mod udp;
+#[cfg(not(wasm_browser))]
 mod util;
 
 /// Connection errors.
@@ -161,6 +163,9 @@ pub struct ClientBuilder {
     dns_resolver: DnsResolver,
     /// Cache for public keys of remote endpoints.
     key_cache: KeyCache,
+    /// ember: whether to ask the relay for its UDP way (protos/udp.rs).
+    #[cfg(not(wasm_browser))]
+    udp: bool,
 }
 
 impl ClientBuilder {
@@ -180,7 +185,19 @@ impl ClientBuilder {
             dns_resolver,
             key_cache: KeyCache::new(128),
             auth_token: None,
+            #[cfg(not(wasm_browser))]
+            udp: false,
         }
+    }
+
+    /// ember: whether to ask the relay for its UDP way (off by default).
+    ///
+    /// With it, a relay that offers one gets and gives this client's datagrams over UDP only, never by the WebSocket,
+    /// which stays the connection; a relay that offers none relays them by the WebSocket as before.
+    #[cfg(not(wasm_browser))]
+    pub fn udp(mut self, udp: bool) -> Self {
+        self.udp = udp;
+        self
     }
 
     /// Sets a custom TLS config.
@@ -298,6 +315,11 @@ impl ClientBuilder {
             .as_ref()
             .local_addr()
             .map_err(|_| e!(ConnectError::NoLocalAddr))?;
+        // ember: the relay's UDP way goes to the address this connection reached it at, not through a proxy.
+        let udp_peer = match self.udp && self.proxy_url.is_none() {
+            true => stream.as_ref().peer_addr().ok(),
+            false => None,
+        };
 
         let mut builder = tokio_websockets::ClientBuilder::new()
             .uri(dial_url.as_str())
@@ -322,6 +344,15 @@ impl ClientBuilder {
                 .map_err(|_| e!(ConnectError::InvalidAuthToken))?;
             builder = builder
                 .add_header(AUTHORIZATION, value)
+                .expect("valid header name");
+        }
+
+        if udp_peer.is_some() {
+            builder = builder
+                .add_header(
+                    http::HeaderName::from_static(crate::protos::udp::UDP_HEADER),
+                    HeaderValue::from_static("1"),
+                )
                 .expect("valid header name");
         }
 
@@ -354,6 +385,12 @@ impl ClientBuilder {
                 })
             })?;
 
+        let udp_offer = response
+            .headers()
+            .get(crate::protos::udp::UDP_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::protos::udp::parse_offer);
+
         let conn = Conn::new(
             conn,
             self.key_cache.clone(),
@@ -362,11 +399,29 @@ impl ClientBuilder {
         )
         .await?;
 
+        let udp = match (udp_peer, udp_offer) {
+            (Some(peer), Some((port, token))) => {
+                let relay = SocketAddr::new(peer.ip(), port);
+                match udp::UdpLink::start(relay, token, self.key_cache.clone()).await {
+                    Ok(udp) => {
+                        debug!(%relay, "relay offers udp");
+                        Some(udp)
+                    }
+                    Err(err) => {
+                        debug!(%relay, "relay's udp way not opened: {err}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         trace!("connect done");
 
         Ok(Client {
             conn,
             local_addr: Some(local_addr),
+            udp,
         })
     }
 
@@ -448,19 +503,72 @@ impl ClientBuilder {
 pub struct Client {
     conn: Conn,
     local_addr: Option<SocketAddr>,
+    /// ember: the relay's UDP way and what it brings.
+    #[cfg(not(wasm_browser))]
+    udp: Option<(udp::UdpHalf, tokio::sync::mpsc::Receiver<RelayToClientMsg>)>,
 }
 
 impl Client {
     /// Splits the client into a sink and a stream.
     pub fn split(self) -> (ClientStream, ClientSink) {
         let (sink, stream) = split(self.conn);
+        #[cfg(not(wasm_browser))]
+        let (stream_udp, sink_udp) = match self.udp {
+            Some((half, rx)) => (Some((half.clone(), rx)), Some(half)),
+            None => (None, None),
+        };
         (
             ClientStream {
                 stream,
                 local_addr: self.local_addr,
+                #[cfg(not(wasm_browser))]
+                udp: stream_udp,
             },
-            ClientSink { sink },
+            ClientSink {
+                sink,
+                #[cfg(not(wasm_browser))]
+                udp: sink_udp,
+            },
         )
+    }
+}
+
+/// ember: a message from the relay, the UDP way's first.
+#[cfg(not(wasm_browser))]
+fn poll_next_with_udp<S>(
+    udp: &mut Option<(udp::UdpHalf, tokio::sync::mpsc::Receiver<RelayToClientMsg>)>,
+    stream: Pin<&mut S>,
+    cx: &mut task::Context<'_>,
+) -> Poll<Option<Result<RelayToClientMsg, RecvError>>>
+where
+    S: Stream<Item = Result<RelayToClientMsg, RecvError>>,
+{
+    if let Some((_, rx)) = udp {
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
+            // Its task ended: the WebSocket alone from now on.
+            Poll::Ready(None) => *udp = None,
+            Poll::Pending => {}
+        }
+    }
+    stream.poll_next(cx)
+}
+
+/// ember: whether the UDP way took the message (each datagram, once it has a way).
+#[cfg(not(wasm_browser))]
+fn sent_by_udp(udp: Option<&udp::UdpHalf>, item: &ClientToRelayMsg) -> bool {
+    match (udp, item) {
+        (
+            Some(half),
+            ClientToRelayMsg::Datagrams {
+                dst_endpoint_id,
+                datagrams,
+            },
+        ) if !datagrams.contents.is_empty() => {
+            half.link.send(dst_endpoint_id, datagrams);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -468,6 +576,12 @@ impl Stream for Client {
     type Item = Result<RelayToClientMsg, RecvError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
+        #[cfg(not(wasm_browser))]
+        {
+            let this = &mut *self;
+            poll_next_with_udp(&mut this.udp, Pin::new(&mut this.conn), cx)
+        }
+        #[cfg(wasm_browser)]
         Pin::new(&mut self.conn).poll_next(cx)
     }
 }
@@ -483,6 +597,10 @@ impl Sink<ClientToRelayMsg> for Client {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: ClientToRelayMsg) -> Result<(), Self::Error> {
+        #[cfg(not(wasm_browser))]
+        if sent_by_udp(self.udp.as_ref().map(|(half, _)| half), &item) {
+            return Ok(());
+        }
         Pin::new(&mut self.conn).start_send(item)
     }
 
@@ -505,6 +623,8 @@ impl Sink<ClientToRelayMsg> for Client {
 #[derive(Debug)]
 pub struct ClientSink {
     sink: SplitSink<Conn, ClientToRelayMsg>,
+    #[cfg(not(wasm_browser))]
+    udp: Option<udp::UdpHalf>,
 }
 
 impl Sink<ClientToRelayMsg> for ClientSink {
@@ -518,6 +638,10 @@ impl Sink<ClientToRelayMsg> for ClientSink {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: ClientToRelayMsg) -> Result<(), Self::Error> {
+        #[cfg(not(wasm_browser))]
+        if sent_by_udp(self.udp.as_ref(), &item) {
+            return Ok(());
+        }
         Pin::new(&mut self.sink).start_send(item)
     }
 
@@ -541,6 +665,8 @@ impl Sink<ClientToRelayMsg> for ClientSink {
 pub struct ClientStream {
     stream: SplitStream<Conn>,
     local_addr: Option<SocketAddr>,
+    #[cfg(not(wasm_browser))]
+    udp: Option<(udp::UdpHalf, tokio::sync::mpsc::Receiver<RelayToClientMsg>)>,
 }
 
 impl ClientStream {
@@ -554,6 +680,12 @@ impl Stream for ClientStream {
     type Item = Result<RelayToClientMsg, RecvError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
+        #[cfg(not(wasm_browser))]
+        {
+            let this = &mut *self;
+            poll_next_with_udp(&mut this.udp, Pin::new(&mut this.stream), cx)
+        }
+        #[cfg(wasm_browser)]
         Pin::new(&mut self.stream).poll_next(cx)
     }
 }

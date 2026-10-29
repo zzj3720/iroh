@@ -137,6 +137,8 @@ pub struct Builder {
     /// [`Builder::address_lookup`].
     addr_filter: Option<AddrFilter>,
     proxy_url: Option<Url>,
+    /// ember: [`Builder::relay_udp`].
+    relay_udp: bool,
     ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
     dns_resolver: Option<DnsResolver>,
@@ -205,6 +207,7 @@ impl Builder {
             address_lookup_user_data: Default::default(),
             addr_filter: None,
             proxy_url: None,
+            relay_udp: false,
             ca_tls_config: None,
             #[cfg(not(wasm_browser))]
             dns_resolver: None,
@@ -268,6 +271,7 @@ impl Builder {
             secret_key,
             address_lookup_user_data: self.address_lookup_user_data,
             proxy_url: self.proxy_url,
+            relay_udp: self.relay_udp,
             #[cfg(not(wasm_browser))]
             dns_resolver,
             server_config,
@@ -710,6 +714,14 @@ impl Builder {
     #[cfg(not(wasm_browser))]
     pub fn dns_resolver(mut self, dns_resolver: DnsResolver) -> Self {
         self.dns_resolver = Some(dns_resolver);
+        self
+    }
+
+    /// ember: asks each relay for its UDP way (iroh-relay's `ClientBuilder::udp`): a relay that offers one carries this
+    /// endpoint's datagrams over UDP only, never by its WebSocket, which stays the connection; one that offers none
+    /// relays them by the WebSocket as before. Off by default; not in browsers.
+    pub fn relay_udp(mut self, relay_udp: bool) -> Self {
+        self.relay_udp = relay_udp;
         self
     }
 

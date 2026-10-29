@@ -94,6 +94,7 @@ tokio = { version = "1", features = [
     "net",
     "fs",
     "io-std",
+    "time",
 ] }
 tokio-websockets = { version = "0.13", features = ["rustls-bring-your-own-connector", "getrandom", "rand", "client", "sha1_smol"] }
 

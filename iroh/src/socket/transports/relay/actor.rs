@@ -208,6 +208,8 @@ struct RelayConnectionOptions {
     prefer_ipv6: Arc<AtomicBool>,
     tls_config: rustls::ClientConfig,
     auth_token: Option<String>,
+    /// ember: whether to ask the relay for its UDP way.
+    udp: bool,
 }
 
 /// Possible reasons for a failed relay connection.
@@ -297,6 +299,7 @@ impl ActiveRelayActor {
             prefer_ipv6,
             tls_config,
             auth_token,
+            udp,
         } = opts;
 
         let mut builder = relay::client::ClientBuilder::new(
@@ -307,6 +310,12 @@ impl ActiveRelayActor {
         )
         .tls_client_config(tls_config)
         .address_family_selector(move || prefer_ipv6.load(Ordering::Relaxed));
+        #[cfg(not(wasm_browser))]
+        {
+            builder = builder.udp(udp);
+        }
+        #[cfg(wasm_browser)]
+        let _ = udp;
         if let Some(proxy_url) = proxy_url {
             builder = builder.proxy_url(proxy_url);
         }
@@ -872,6 +881,8 @@ pub(crate) struct Config {
     pub dns_resolver: DnsResolver,
     /// Proxy
     pub proxy_url: Option<Url>,
+    /// ember: whether relays are asked for their UDP way.
+    pub relay_udp: bool,
     /// If the last net_report report, reports IPv6 to be available.
     pub ipv6_reported: Arc<AtomicBool>,
     pub tls_config: rustls::ClientConfig,
@@ -1285,6 +1296,7 @@ impl RelayActor {
             prefer_ipv6: self.config.ipv6_reported.clone(),
             tls_config: self.config.tls_config.clone(),
             auth_token,
+            udp: self.config.relay_udp,
         };
 
         // TODO: Replace 64 with PER_CLIENT_SEND_QUEUE_DEPTH once that's unused
@@ -1476,6 +1488,7 @@ mod tests {
                     .client_config(default_provider())
                     .expect("infallible"),
                 auth_token: None,
+                udp: false,
             },
             stop_token,
             metrics: Default::default(),

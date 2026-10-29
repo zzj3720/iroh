@@ -218,6 +218,18 @@ pub(crate) struct EndpointInner {
     runtime: Arc<Runtime>,
     /// Static configuration for the endpoint.
     pub(crate) static_config: StaticConfig,
+    /// ember: the transport configuration and ALPNs as set since (`Endpoint::set_transport_config`, `set_alpns`):
+    /// the one new connections take, both ways.
+    pub(crate) live: std::sync::Mutex<LiveConfig>,
+}
+
+/// ember: what an endpoint's new connections take now (`EndpointInner::live`).
+#[derive(Debug, Default)]
+pub(crate) struct LiveConfig {
+    /// Set since it was bound, else the bound one's.
+    pub(crate) transport_config: Option<QuicTransportConfig>,
+    /// The ALPNs accepted, as last set.
+    pub(crate) alpns: Vec<Vec<u8>>,
 }
 
 impl Drop for EndpointInner {
@@ -378,6 +390,9 @@ pub(crate) struct Socket {
     configured_addrs: RwLock<BTreeSet<SocketAddr>>,
 
     pub(crate) tls_config: rustls::ClientConfig,
+
+    /// ember: whether relays are asked for their UDP way, read at each dial of one (`Endpoint::set_relay_udp`).
+    pub(crate) relay_udp: Arc<AtomicBool>,
 
     /// Metrics
     pub(crate) metrics: EndpointMetrics,
@@ -933,6 +948,7 @@ impl EndpointInner {
         };
 
         let ipv6_reported = Arc::new(AtomicBool::new(false));
+        let relay_udp = Arc::new(AtomicBool::new(relay_udp));
 
         let relay_actor_config = RelayActorConfig {
             my_relay: HomeRelayWatch::default(),
@@ -940,7 +956,7 @@ impl EndpointInner {
             #[cfg(not(wasm_browser))]
             dns_resolver: dns_resolver.clone(),
             proxy_url: proxy_url.clone(),
-            relay_udp,
+            relay_udp: relay_udp.clone(),
             ipv6_reported: ipv6_reported.clone(),
             tls_config: tls_config.clone(),
             metrics: metrics.socket.clone(),
@@ -1021,6 +1037,7 @@ impl EndpointInner {
             #[cfg(not(wasm_browser))]
             ip_bind_addrs: transports.ip_bind_addrs(),
             tls_config: tls_config.clone(),
+            relay_udp,
             hooks,
             span: span.clone(),
         });
@@ -1129,6 +1146,7 @@ impl EndpointInner {
             endpoint,
             runtime,
             static_config,
+            live: Default::default(),
         })
     }
 
@@ -1308,6 +1326,16 @@ impl EndpointInner {
             .ok();
     }
 
+    /// ember: asks relays for their UDP way from the next dial of each, and dials each again now when that changed.
+    pub(crate) async fn set_relay_udp(&self, on: bool) {
+        if self.sock.relay_udp.swap(on, Ordering::Relaxed) != on {
+            self.actor_sender
+                .send(ActorMessage::ReconnectRelays)
+                .await
+                .ok();
+        }
+    }
+
     #[cfg(all(test, with_crypto_provider))]
     async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
@@ -1407,6 +1435,8 @@ enum ActorMessage {
     ),
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
     DirectAddrRefresh,
+    /// ember: every relay link dialed again (`Endpoint::set_relay_udp`).
+    ReconnectRelays,
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
@@ -1795,6 +1825,9 @@ impl Actor {
             }
             ActorMessage::RelayMapChange => {
                 self.handle_relay_map_change();
+            }
+            ActorMessage::ReconnectRelays => {
+                self.transports_network_change.reconnect_relays();
             }
             ActorMessage::ResolveRemote(addr, tx) => {
                 self.remote_map.resolve_remote(addr, tx).await;

@@ -52,6 +52,20 @@ pub async fn run_relay_server_with_access(
     quic: bool,
     access: Arc<dyn DynAccessControl>,
 ) -> Result<(RelayMap, RelayUrl, Server), SpawnError> {
+    run_relay_server_full(quic, access, false).await
+}
+
+/// ember: runs a relay server with its UDP way (iroh-relay's `udp_bind_addr`) on a free port, as
+/// [`run_relay_server_with`]`(false)` otherwise.
+pub async fn run_relay_server_with_udp() -> Result<(RelayMap, RelayUrl, Server), SpawnError> {
+    run_relay_server_full(false, Arc::new(AllowAll), true).await
+}
+
+async fn run_relay_server_full(
+    quic: bool,
+    access: Arc<dyn DynAccessControl>,
+    udp: bool,
+) -> Result<(RelayMap, RelayUrl, Server), SpawnError> {
     let (_certs, server_config) = iroh_relay::server::testing::self_signed_tls_certs_and_config();
 
     let tls = TlsConfig::new(
@@ -63,6 +77,7 @@ pub async fn run_relay_server_with_access(
     relay.tls = Some(tls);
     relay.key_cache_capacity = Some(1024);
     relay.access = access;
+    relay.udp_bind_addr = udp.then(|| (Ipv4Addr::LOCALHOST, 0).into());
 
     let mut config = ServerConfig::default();
     config.relay = Some(relay);

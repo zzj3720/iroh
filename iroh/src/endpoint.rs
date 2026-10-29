@@ -253,6 +253,7 @@ impl Builder {
             token_key,
             token_store: Arc::new(noq::TokenMemoryCache::default()),
         };
+        let alpns = self.alpn_protocols.clone();
         let server_config = static_config.create_server_config(self.alpn_protocols);
 
         #[cfg(not(wasm_browser))]
@@ -294,6 +295,7 @@ impl Builder {
             "iroh endpoint bound"
         );
 
+        inner.live.lock().expect("poisoned").alpns = alpns;
         let ep = Endpoint {
             inner: Arc::new(inner),
         };
@@ -1009,10 +1011,42 @@ impl Endpoint {
             warn!("Attempting to set ALPNs for a closed endpoint. Ignoring.");
             return;
         }
-        let server_config = self.inner.static_config.create_server_config(alpns);
+        let mut live = self.inner.live.lock().expect("poisoned");
+        live.alpns = alpns.clone();
+        let mut server_config = self.inner.static_config.create_server_config(alpns);
+        if let Some(transport) = &live.transport_config {
+            server_config.transport_config(transport.to_inner_arc());
+        }
         self.inner
             .noq_endpoint()
             .set_server_config(Some(server_config));
+    }
+
+    /// ember: the transport configuration (its congestion controller among it) of the connections made from now on,
+    /// dialed and accepted: one made already keeps its own. As [`Builder::transport_config`] gave it at the start.
+    ///
+    /// If the endpoint is closed, this logs a warning and does nothing.
+    pub fn set_transport_config(&self, transport_config: QuicTransportConfig) {
+        if self.is_closed() {
+            warn!("Attempting to set the transport config of a closed endpoint. Ignoring.");
+            return;
+        }
+        let mut live = self.inner.live.lock().expect("poisoned");
+        let mut server_config = self
+            .inner
+            .static_config
+            .create_server_config(live.alpns.clone());
+        server_config.transport_config(transport_config.to_inner_arc());
+        live.transport_config = Some(transport_config);
+        self.inner
+            .noq_endpoint()
+            .set_server_config(Some(server_config));
+    }
+
+    /// ember: whether relays are asked for their UDP way ([`Builder::relay_udp`]), from now on: each relay link
+    /// is dialed again when it changes, its connections going on over the new way.
+    pub async fn set_relay_udp(&self, relay_udp: bool) {
+        self.inner.set_relay_udp(relay_udp).await;
     }
 
     /// Adds the provided configuration to the [`RelayMap`].
@@ -1170,6 +1204,14 @@ impl Endpoint {
 
         let transport_config = options
             .transport_config
+            .or_else(|| {
+                self.inner
+                    .live
+                    .lock()
+                    .expect("poisoned")
+                    .transport_config
+                    .clone()
+            })
             .map(|cfg| cfg.to_inner_arc())
             .unwrap_or(self.inner.static_config.transport_config.to_inner_arc());
 
@@ -2563,6 +2605,120 @@ mod tests {
             ConnectionError::ApplicationClosed(ApplicationClose { .. })
         ));
 
+        Ok(())
+    }
+
+    /// ember: the relays' UDP way switched on and off while connected (`Endpoint::set_relay_udp`): each relay link is
+    /// dialed again, the connection and its stream going on, its datagrams then over UDP (the relay's UDP counters go
+    /// up) and then not.
+    #[tokio::test]
+    #[traced_test]
+    async fn endpoint_relay_udp_switched_while_connected() -> Result {
+        let (map, _url, relay) = crate::test_utils::run_relay_server_with_udp().await?;
+        let bind = |seed: u64| {
+            let map = map.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::N0)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(map))
+                    .clear_ip_transports()
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(1).await?;
+        let client = bind(0).await?;
+        server.online().await;
+        client.online().await;
+        let addr = server.addr();
+        let echo = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.anyerr()?.await.anyerr()?;
+                let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
+                let mut buf = [0u8; 8];
+                while recv.read_exact(&mut buf).await.is_ok() {
+                    send.write_all(&buf).await.anyerr()?;
+                }
+                Ok::<_, Error>(conn)
+            }
+        });
+        let conn = client.connect(addr.clone(), TEST_ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+        let mut n = 0u64;
+        let mut round = async |send: &mut crate::endpoint::SendStream,
+                               recv: &mut crate::endpoint::RecvStream|
+               -> Result {
+            n += 1;
+            send.write_all(&n.to_be_bytes()).await.anyerr()?;
+            let mut buf = [0u8; 8];
+            time::timeout(Duration::from_secs(10), recv.read_exact(&mut buf))
+                .await
+                .anyerr()?
+                .anyerr()?;
+            assert_eq!(u64::from_be_bytes(buf), n);
+            Ok(())
+        };
+        let udp = || relay.metrics().server.udp_bytes_recv.get();
+        round(&mut send, &mut recv).await?;
+        assert_eq!(udp(), 0, "off: by the WebSocket");
+
+        client.set_relay_udp(true).await;
+        server.set_relay_udp(true).await;
+        // Once both links are dialed again with it, what comes goes over UDP.
+        time::timeout(Duration::from_secs(20), async {
+            loop {
+                let before = udp();
+                round(&mut send, &mut recv).await?;
+                if udp() > before {
+                    return Ok::<_, Error>(());
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .anyerr()??;
+        for _ in 0..5 {
+            round(&mut send, &mut recv).await?;
+        }
+
+        client.set_relay_udp(false).await;
+        server.set_relay_udp(false).await;
+        time::timeout(Duration::from_secs(20), async {
+            loop {
+                let before = udp();
+                round(&mut send, &mut recv).await?;
+                if udp() == before {
+                    return Ok::<_, Error>(());
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .anyerr()??;
+        round(&mut send, &mut recv).await?;
+
+        // A transport config set now is what connections made from now on take, the server's accepting ones too.
+        let later = crate::endpoint::QuicTransportConfig::builder()
+            .max_idle_timeout(Some(Duration::from_secs(7).try_into().anyerr()?))
+            .build();
+        server.set_transport_config(later.clone());
+        assert!(
+            server
+                .inner
+                .live
+                .lock()
+                .expect("poisoned")
+                .transport_config
+                .is_some()
+        );
+        conn.close(0u32.into(), b"done");
+        echo.abort();
+        client.close().await;
+        server.close().await;
         Ok(())
     }
 

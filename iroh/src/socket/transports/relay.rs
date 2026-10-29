@@ -243,6 +243,11 @@ impl RelayNetworkChangeSender {
         self.send_relay_actor(RelayActorMessage::CheckConnectionAfterNetworkChange);
     }
 
+    /// ember: every link of this transport dialed again.
+    pub(super) fn reconnect(&self) {
+        self.send_relay_actor(RelayActorMessage::Reconnect);
+    }
+
     pub(super) fn rebind(&self) -> io::Result<()> {
         self.send_relay_actor(RelayActorMessage::MaybeCloseRelaysOnRebind);
 

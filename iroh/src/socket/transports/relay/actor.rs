@@ -137,6 +137,8 @@ struct ActiveRelayActor {
     url: RelayUrl,
     /// Builder which can repeatedly build a relay client.
     relay_client_builder: relay::client::ClientBuilder,
+    /// ember: whether the relay's UDP way is asked for, read at each dial.
+    udp: Arc<AtomicBool>,
     /// Whether or not this is the home relay server.
     ///
     /// The home relay server needs to maintain it's connection to the relay server, even if
@@ -167,6 +169,8 @@ enum ActiveRelayMessage {
     CheckConnection { local_ips: Vec<IpAddr> },
     /// Sets this relay as the home relay, or not.
     SetHomeRelay(bool),
+    /// ember: the link dialed again (`Endpoint::set_relay_udp`); none is dialed while not connected.
+    Reconnect,
     #[cfg(test)]
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
     #[cfg(test)]
@@ -208,8 +212,8 @@ struct RelayConnectionOptions {
     prefer_ipv6: Arc<AtomicBool>,
     tls_config: rustls::ClientConfig,
     auth_token: Option<String>,
-    /// ember: whether to ask the relay for its UDP way.
-    udp: bool,
+    /// ember: whether to ask the relay for its UDP way, read at each dial.
+    udp: Arc<AtomicBool>,
 }
 
 /// Possible reasons for a failed relay connection.
@@ -237,6 +241,8 @@ enum RunError {
     LocalAddrMissing,
     #[error("Stream closed by server.")]
     StreamClosedServer,
+    #[error("Dialed again, as asked")]
+    Reconnect,
     #[error("Client stream read failed")]
     ClientStreamRead {
         #[error(std_err)]
@@ -271,6 +277,7 @@ impl ActiveRelayActor {
             metrics,
             my_relay,
         } = opts;
+        let udp = connection_opts.udp.clone();
         let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts);
         ActiveRelayActor {
             prio_inbox,
@@ -279,6 +286,7 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             url,
             relay_client_builder,
+            udp,
             is_home_relay: false,
             inactive_timeout: Box::pin(time::sleep(RELAY_INACTIVE_CLEANUP_TIME)),
             stop_token,
@@ -310,11 +318,6 @@ impl ActiveRelayActor {
         )
         .tls_client_config(tls_config)
         .address_family_selector(move || prefer_ipv6.load(Ordering::Relaxed));
-        #[cfg(not(wasm_browser))]
-        {
-            builder = builder.udp(udp);
-        }
-        #[cfg(wasm_browser)]
         let _ = udp;
         if let Some(proxy_url) = proxy_url {
             builder = builder.proxy_url(proxy_url);
@@ -458,7 +461,7 @@ impl ActiveRelayActor {
                         ActiveRelayMessage::SetHomeRelay(is_home) => {
                             self.set_home_relay(is_home);
                         }
-                        ActiveRelayMessage::CheckConnection { .. } => {}
+                        ActiveRelayMessage::CheckConnection { .. } | ActiveRelayMessage::Reconnect => {}
                         #[cfg(test)]
                         ActiveRelayMessage::GetLocalAddr(sender) => {
                             sender.send(None).ok();
@@ -495,6 +498,9 @@ impl ActiveRelayActor {
     // This is using `impl Future` to return a future without a reference to self.
     fn dial_relay(&self) -> impl Future<Output = Result<Client, DialError>> + use<> {
         let client_builder = self.relay_client_builder.clone();
+        // ember: the UDP way asked for as the endpoint says now (`Endpoint::set_relay_udp`).
+        #[cfg(not(wasm_browser))]
+        let client_builder = client_builder.udp(self.udp.load(Ordering::Relaxed));
         async move {
             match time::timeout(CONNECT_TIMEOUT, client_builder.connect()).await {
                 Ok(Ok(client)) => Ok(client),
@@ -592,6 +598,7 @@ impl ActiveRelayActor {
                                     .set_status(&self.url, RelayConnectionState::Connected);
                             }
                         }
+                        ActiveRelayMessage::Reconnect => break Err(e!(RunError::Reconnect)),
                         ActiveRelayMessage::CheckConnection { local_ips } => {
                             match client_stream.local_addr() {
                                 Some(addr) if local_ips.contains(&addr.ip()) => {
@@ -839,6 +846,8 @@ impl ConnectedRelayState {
 
 pub(super) enum RelayActorMessage {
     MaybeCloseRelaysOnRebind,
+    /// ember: every active relay's link dialed again.
+    Reconnect,
     NetworkChange {
         report: Report,
     },
@@ -881,8 +890,8 @@ pub(crate) struct Config {
     pub dns_resolver: DnsResolver,
     /// Proxy
     pub proxy_url: Option<Url>,
-    /// ember: whether relays are asked for their UDP way.
-    pub relay_udp: bool,
+    /// ember: whether relays are asked for their UDP way, read at each dial.
+    pub relay_udp: Arc<AtomicBool>,
     /// If the last net_report report, reports IPv6 to be available.
     pub ipv6_reported: Arc<AtomicBool>,
     pub tls_config: rustls::ClientConfig,
@@ -1107,6 +1116,15 @@ impl RelayActor {
             RelayActorMessage::MaybeCloseRelaysOnRebind => {
                 self.maybe_close_relays_on_rebind().await;
             }
+            RelayActorMessage::Reconnect => {
+                for handle in self.active_relays.values() {
+                    handle
+                        .inbox_addr
+                        .send(ActiveRelayMessage::Reconnect)
+                        .await
+                        .ok();
+                }
+            }
             RelayActorMessage::CheckConnectionAfterNetworkChange => {
                 self.check_connection_after_network_change().await;
             }
@@ -1296,7 +1314,7 @@ impl RelayActor {
             prefer_ipv6: self.config.ipv6_reported.clone(),
             tls_config: self.config.tls_config.clone(),
             auth_token,
-            udp: self.config.relay_udp,
+            udp: self.config.relay_udp.clone(),
         };
 
         // TODO: Replace 64 with PER_CLIENT_SEND_QUEUE_DEPTH once that's unused
@@ -1488,7 +1506,7 @@ mod tests {
                     .client_config(default_provider())
                     .expect("infallible"),
                 auth_token: None,
-                udp: false,
+                udp: Default::default(),
             },
             stop_token,
             metrics: Default::default(),

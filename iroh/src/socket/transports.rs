@@ -708,6 +708,13 @@ impl NetworkChangeSender {
         }
     }
 
+    /// ember: every relay link dialed again (`Endpoint::set_relay_udp`).
+    pub(crate) fn reconnect_relays(&self) {
+        for relay in &self.relay {
+            relay.reconnect();
+        }
+    }
+
     /// Rebinds underlying connections, if necessary.
     pub(crate) fn rebind(&self) -> std::io::Result<()> {
         let mut res = Ok(());

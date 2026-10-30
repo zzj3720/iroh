@@ -5,12 +5,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::util;
+use super::{tcp::TcpStream, util};
 use crate::ExportKeyingMaterial;
 
 #[derive(Debug)]

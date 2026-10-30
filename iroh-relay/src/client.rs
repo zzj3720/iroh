@@ -40,6 +40,8 @@ pub(crate) mod streams;
 #[cfg(not(wasm_browser))]
 mod tls;
 #[cfg(not(wasm_browser))]
+mod tcp;
+#[cfg(not(wasm_browser))]
 mod udp;
 #[cfg(not(wasm_browser))]
 mod util;

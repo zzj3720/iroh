@@ -98,9 +98,12 @@ tokio = { version = "1", features = [
 ] }
 tokio-websockets = { version = "0.13", features = ["rustls-bring-your-own-connector", "getrandom", "rand", "client", "sha1_smol"] }
 
-# ember: the relay keeps what a client's socket has yet to send small (server/http_server.rs, NOTSENT_LOWAT)
-[target.'cfg(target_os = "linux")'.dependencies]
+# ember: bounded unsent data on the relay server (Linux) and macOS relay clients.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 # wasm-in-browser dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]

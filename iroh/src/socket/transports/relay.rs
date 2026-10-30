@@ -278,6 +278,20 @@ pub(crate) struct RelaySender {
 }
 
 impl RelaySender {
+    #[cfg(test)]
+    pub(crate) fn bounded_for_test(capacity: usize) -> (Self, mpsc::Receiver<RelaySendItem>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            Self {
+                sender: PollSender::new(sender),
+                relay_map: iroh_relay::RelayMap::empty(),
+                excludes: Vec::new(),
+            },
+            receiver,
+        )
+    }
+
+
     /// ember: whether `url` is one of this transport's relays.
     pub(super) fn owns(&self, url: &RelayUrl) -> bool {
         self.relay_map.contains(url) && !self.excludes.contains(url)

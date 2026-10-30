@@ -13,6 +13,7 @@ use iroh::{
 };
 use n0_error::{Result, StdResultExt};
 use n0_future::time;
+use iroh::Watcher;
 
 const TEST_ALPN: &[u8] = b"n0/iroh/test";
 
@@ -163,5 +164,74 @@ async fn endpoint_home_on_every_relay_leaves_a_relay_gone_slow() -> Result {
     conn.close(0u8.into(), b"");
     client.close().await;
     let _ = echo.await;
+    Ok(())
+}
+
+// A peer's selected path belongs to an older connection. Once it goes slow, a second
+// connection must still reach the healthy relay, as a fresh endpoint can. Assert the
+// route reached, not how long the machine took to complete the handshake.
+#[tokio::test]
+async fn new_connection_races_relays_despite_an_existing_selected_path() -> Result {
+    let (_map_a, url_a, _relay_a) = run_relay_server_with(false).await?;
+    let (_map_b, url_b, _relay_b) = run_relay_server_with(false).await?;
+    let delay_a = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let delay_b = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let via_a = delayed_relay(&url_a, delay_a.clone()).await?;
+    let via_b = delayed_relay(&url_b, delay_b.clone()).await?;
+    let relays = RelayMap::from_iter([via_a.clone(), via_b.clone()]);
+    let bind = || Endpoint::builder(presets::N0)
+        .alpns(vec![TEST_ALPN.to_vec()])
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+        .relay_mode(RelayMode::Custom(relays.clone()))
+        .home_on_every_relay().clear_ip_transports().bind();
+    let server = bind().await?;
+    let client = bind().await?;
+    let fresh = bind().await?;
+    for ep in [&server, &client, &fresh] {
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = ep.home_relay_status().get();
+                if status.len() == 2 && status.iter().all(|s| s.is_connected()) { break; }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.anyerr()?;
+    }
+    let accepting = server.clone();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(incoming) = accepting.accept().await {
+            held.push(incoming.await.unwrap());
+        }
+    });
+    let addr = server.addr();
+    let old = client.connect(addr.clone(), TEST_ALPN).await?;
+    let selected = time::timeout(Duration::from_secs(10), async {
+        loop {
+            if old.paths().iter().filter(|p| p.is_relay()).count() >= 2 {
+                if let Some(TransportAddr::Relay(url)) = old.paths().iter().find(|p| p.is_selected()).map(|p| p.remote_addr().clone()) { break url; }
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.anyerr()?;
+    let delayed = if selected == via_a { &delay_a } else { &delay_b };
+    delayed.store(75, std::sync::atomic::Ordering::Relaxed);
+    let begin = time::Instant::now();
+    let (reused, clean) = tokio::join!(
+        async { let c = client.connect(addr.clone(), TEST_ALPN).await?; Ok::<_, n0_error::AnyError>((begin.elapsed(), c)) },
+        async { let c = fresh.connect(addr.clone(), TEST_ALPN).await?; Ok::<_, n0_error::AnyError>((begin.elapsed(), c)) },
+    );
+    let (reused_ms, reused) = reused?;
+    let (clean_ms, clean) = clean?;
+    println!("RELAY-HANDSHAKE selected={selected} reused={}ms fresh={}ms", reused_ms.as_millis(), clean_ms.as_millis());
+    for (label, c) in [("old", &old), ("reused", &reused), ("fresh", &clean)] {
+        for p in c.paths().iter() { println!("RELAY-HANDSHAKE {label} selected={} addr={:?} rtt={}ms", p.is_selected(), p.remote_addr(), p.stats().rtt.as_millis()); }
+    }
+    let healthy = if selected == via_a { via_b } else { via_a };
+    assert!(
+        reused.paths().iter().any(|p| p.remote_addr() == &TransportAddr::Relay(healthy.clone())),
+        "the new handshake inherited the old slow path instead of reaching the healthy relay"
+    );
+    reused.close(0u8.into(), b"done"); clean.close(0u8.into(), b"done"); old.close(0u8.into(), b"done");
+    client.close().await; fresh.close().await; server.close().await; task.abort();
     Ok(())
 }

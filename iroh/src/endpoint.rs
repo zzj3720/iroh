@@ -860,8 +860,8 @@ impl Builder {
     ///
     /// The path selector decides which path to use among the candidate paths to a
     /// remote endpoint.  By default iroh uses a built-in selector that sorts paths by
-    /// biased RTT (with IPv6 preferred over IPv4 and relay treated as backup) and is
-    /// sticky to avoid flapping.  Pass a custom [`PathSelector`] here to override that
+    /// biased RTT (with a small preference for IPv6) and is sticky to avoid flapping.
+    /// Pass a custom [`PathSelector`] here to override that
     /// policy — for example, to make a custom transport always win over IP.
     ///
     /// Takes an `Arc<dyn PathSelector>` so the same selector instance can be shared

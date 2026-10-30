@@ -30,25 +30,11 @@ fn switching_margin(current_biased: i128) -> i128 {
     (RTT_SWITCHING_MIN.as_nanos() as i128).max(current_biased / 4)
 }
 
-/// Whether a transport is a primary path or a backup.
-///
-/// Primary paths are used preferentially.  Backup paths are only used when no primary
-/// path is available.  This is independent of the QUIC `PathStatus`; today the only
-/// transport classified as backup is the relay transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum TransportType {
-    /// A primary path: used whenever available.
-    Primary,
-    /// A backup path: only used when no primary path is available.
-    Backup,
-}
-
 /// Bias configuration for a single transport kind.
 ///
 /// Used by [`BiasedRttPathSelector`] to bias path selection per address kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TransportBias {
-    transport_type: TransportType,
     /// RTT bias in nanoseconds.  Negative values make this transport more preferred.
     rtt_bias: i128,
 }
@@ -57,15 +43,6 @@ impl TransportBias {
     /// Creates a primary transport bias with no RTT advantage.
     pub(crate) fn primary() -> Self {
         Self {
-            transport_type: TransportType::Primary,
-            rtt_bias: 0,
-        }
-    }
-
-    /// Creates a backup transport bias with no RTT advantage.
-    fn backup() -> Self {
-        Self {
-            transport_type: TransportType::Backup,
             rtt_bias: 0,
         }
     }
@@ -86,14 +63,11 @@ impl TransportBias {
 
 /// The default [`PathSelector`] used by iroh.
 ///
-/// Sorts paths by `(transport_type, biased_rtt)` (primary tier wins, then lowest biased
-/// RTT).  Within the same tier, switching only happens once a candidate's biased RTT is
-/// at least 5ms better than the currently-selected path — this avoids flapping under
-/// jitter.  Across tiers, switching is immediate.
+/// Sorts paths by biased RTT. Switching only happens once a candidate is meaningfully
+/// faster, avoiding flapping under jitter.
 ///
 /// The biases are configured per [`AddrKind`].  Defaults: IPv4 and IPv6 are primary
-/// (IPv6 has a 3ms RTT advantage), Relay is backup, custom transports are primary with
-/// no advantage.
+/// (IPv6 has a 3ms RTT advantage); relay and custom transports have no advantage.
 #[derive(Debug, Clone)]
 pub(crate) struct BiasedRttPathSelector {
     biases: Arc<FxHashMap<AddrKind, TransportBias>>,
@@ -107,7 +81,7 @@ impl Default for BiasedRttPathSelector {
             AddrKind::IpV6,
             TransportBias::primary().with_rtt_advantage(IPV6_RTT_ADVANTAGE),
         );
-        map.insert(AddrKind::Relay, TransportBias::backup());
+        map.insert(AddrKind::Relay, TransportBias::primary());
         Self {
             biases: Arc::new(map),
         }
@@ -134,10 +108,9 @@ impl BiasedRttPathSelector {
     }
 
     /// Computes the sort key for a path: lower is better.
-    fn sort_key(&self, addr: &FourTuple, rtt: Duration) -> (TransportType, i128) {
+    fn sort_key(&self, addr: &FourTuple, rtt: Duration) -> i128 {
         let bias = self.bias_for(addr);
-        let biased_rtt = (rtt.as_nanos() as i128).saturating_add(bias.rtt_bias);
-        (bias.transport_type, biased_rtt)
+        (rtt.as_nanos() as i128).saturating_add(bias.rtt_bias)
     }
 }
 
@@ -148,17 +121,25 @@ impl PathSelector for BiasedRttPathSelector {
         // appears multiple times (one path per connection), `min` over `sort_key`
         // naturally picks the lowest-RTT instance — no separate aggregation needed.
         let current = ctx.current();
-        let mut best: Option<(PathSelectionData<'_>, (TransportType, i128))> = None;
-        let mut current_key: Option<(TransportType, i128)> = None;
+        let mut best: Option<(PathSelectionData<'_>, i128)> = None;
+        let mut current_key: Option<i128> = None;
+        let mut current_seen = false;
+        let mut first = None;
 
         trace!("dumping path RTTs");
         for psd in ctx.paths() {
             let network_path = psd.network_path();
+            current_seen |= Some(network_path) == current;
+            if first.is_none() {
+                first = Some(psd.clone());
+            }
             // Skip paths whose stats can't be read (e.g. closed concurrently with select).
             let Some(stats) = psd.stats() else {
                 continue;
             };
-            let rtt = stats.rtt;
+            let Some(rtt) = stats.same_path_rtt else {
+                continue;
+            };
             trace!(%network_path, ?rtt);
             let key = self.sort_key(network_path, rtt);
 
@@ -171,21 +152,25 @@ impl PathSelector for BiasedRttPathSelector {
         }
 
         let mut selection = PathSelection::none();
-        let Some((best_psd, (best_tier, best_biased))) = best else {
+        // A live current path with no comparable measurement must not be replaced by a guess.
+        if current_seen && current_key.is_none() {
+            return selection;
+        }
+        let Some((best_psd, best_biased)) = best else {
+            // A connection still needs an initial path before any RTT can be measured.
+            if !current_seen && let Some(first) = first {
+                selection.set(&first);
+            }
             return selection;
         };
 
         // If we have no current path or no data for it, switch to the best.
-        let Some((current_tier, current_biased)) = current_key else {
+        let Some(current_biased) = current_key else {
             selection.set(&best_psd);
             return selection;
         };
 
-        if current_tier != best_tier {
-            // Always switch across tiers (e.g. relay -> primary).
-            selection.set(&best_psd);
-        } else if best_biased + switching_margin(current_biased) <= current_biased {
-            // For the same tier, only switch when biased RTT is meaningfully better.
+        if best_biased + switching_margin(current_biased) <= current_biased {
             selection.set(&best_psd);
         }
         selection
@@ -235,6 +220,7 @@ mod tests {
         // PathStats is #[non_exhaustive], so build via Default + field assignment.
         let mut stats = PathStats::default();
         stats.rtt = Duration::from_millis(rtt_ms);
+        stats.same_path_rtt = Some(stats.rtt);
         PathSelectionData::for_test(addr, Some(stats))
     }
 
@@ -270,23 +256,38 @@ mod tests {
     }
 
     #[test]
-    fn primary_wins_over_backup_regardless_of_rtt() {
+    fn faster_path_wins_across_ip_and_relay() {
         let v4 = v4(1);
         let relay = relay(1);
 
-        // Primary tier beats backup tier even when the backup has a much lower RTT.
         let chosen = select_with_default(None, vec![psd(&v4, 100), psd(&relay, 10)]);
-        assert!(matches!(
-            chosen.as_ref().map(|t| t.remote()),
-            Some(Addr::Ip(_))
-        ));
+        assert_eq!(chosen.as_ref(), Some(&relay));
+        let chosen = select_with_default(None, vec![psd(&v4, 10), psd(&relay, 100)]);
+        assert_eq!(chosen.as_ref(), Some(&v4));
+    }
 
-        // Even more extreme: 1000ms primary still wins over 1ms backup.
-        let chosen = select_with_default(None, vec![psd(&v4, 1000), psd(&relay, 1)]);
-        assert!(matches!(
-            chosen.as_ref().map(|t| t.remote()),
-            Some(Addr::Ip(_))
-        ));
+    #[test]
+    fn slow_ip_yields_to_fast_relay() {
+        let ip = v4(1);
+        let relay = relay(1);
+        // An IP route may itself go through an external tunnel or relay.
+        let chosen = select_with_default(Some(&ip), vec![psd(&ip, 1000), psd(&relay, 50)]);
+        assert_eq!(chosen.as_ref(), Some(&relay));
+    }
+
+    #[test]
+    fn unknown_current_rtt_is_not_compared_to_a_known_path() {
+        let ip = v4(1);
+        let relay = relay(1);
+        let unknown = PathSelectionData::for_test(&ip, Some(PathStats::default()));
+        assert_eq!(select_with_default(Some(&ip), vec![unknown, psd(&relay, 10)]), None);
+    }
+
+    #[test]
+    fn a_new_connection_can_start_without_rtt_samples() {
+        let ip = v4(1);
+        let unknown = PathSelectionData::for_test(&ip, Some(PathStats::default()));
+        assert_eq!(select_with_default(None, vec![unknown]).as_ref(), Some(&ip));
     }
 
     #[test]

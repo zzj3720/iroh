@@ -2497,6 +2497,7 @@ dependencies = [
  "iroh-base 1.4.1",
  "iroh-dns 1.4.1",
  "iroh-metrics",
+ "libc",
  "lru 0.18.0",
  "n0-error",
  "n0-future",

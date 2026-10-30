@@ -19,11 +19,11 @@ use n0_future::{
     time::{self},
 };
 use rustls::client::Resumption;
-use tokio::net::TcpStream;
 use tracing::{Instrument, error, info_span};
 
 use super::{
     streams::{MaybeTlsStream, ProxyStream},
+    tcp::TcpStream,
     *,
 };
 use crate::defaults::timeouts::*;
@@ -128,7 +128,7 @@ impl MaybeTlsStreamBuilder {
         &self,
         proxy_url: Url,
         tls_connector: &tokio_rustls::TlsConnector,
-    ) -> Result<util::Chain<std::io::Cursor<Bytes>, MaybeTlsStream<tokio::net::TcpStream>>, DialError>
+    ) -> Result<util::Chain<std::io::Cursor<Bytes>, MaybeTlsStream<TcpStream>>, DialError>
     {
         debug!(%self.url, %proxy_url, "dial url via proxy");
 
@@ -217,7 +217,7 @@ impl MaybeTlsStreamBuilder {
             .await
             .map_err(|err| e!(DialError::ProxyConnect, err))?;
         let Parts { io, read_buf, .. } = upgraded
-            .downcast::<TokioIo<MaybeTlsStream<tokio::net::TcpStream>>>()
+            .downcast::<TokioIo<MaybeTlsStream<TcpStream>>>()
             .expect("only this upgrade used");
 
         let res = util::chain(std::io::Cursor::new(read_buf), io.into_inner());

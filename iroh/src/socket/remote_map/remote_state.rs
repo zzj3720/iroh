@@ -865,7 +865,11 @@ impl State {
         // though we might not have a relay transport or ip-capable transport set up.
         // So these errors must not be fatal for this actor (or even this operation).
 
-        if let Some(addr) = self.selected_path.as_ref() {
+        // Initial packets belong to a new connection, while selected_path belongs to the peer.
+        // With every relay available, race them again: an older connection's selection may have
+        // become slow before its next RTT sample or path reselection. Established packets use
+        // their concrete path in TransportsSender and do not enter this branch.
+        if let Some(addr) = self.selected_path.as_ref().filter(|_| !self.several_relays) {
             trace!(?addr, "sending datagram to selected path");
 
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
@@ -881,15 +885,17 @@ impl State {
                 "sending datagram to all known paths",
             );
             // ember: kept for addresses found later (see `unanswered`).
-            match &mut self.unanswered {
-                Some((kept_sender, kept)) => {
-                    *kept_sender = sender.clone();
-                    if kept.len() == UNANSWERED_KEPT {
-                        kept.remove(0);
+            if self.selected_path.is_none() {
+                match &mut self.unanswered {
+                    Some((kept_sender, kept)) => {
+                        *kept_sender = sender.clone();
+                        if kept.len() == UNANSWERED_KEPT {
+                            kept.remove(0);
+                        }
+                        kept.push(transmit.clone());
                     }
-                    kept.push(transmit.clone());
+                    None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
                 }
-                None => self.unanswered = Some((sender.clone(), vec![transmit.clone()])),
             }
             if self.paths.is_empty() {
                 warn!("Cannot send datagrams: No paths to remote endpoint known");

@@ -64,6 +64,11 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 /// Even if we have some non-relay route that works.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// ember: how often the path is chosen again from its connections' paths' RTTs. Chosen only as a path opened, was
+/// established or was given up, a connection stayed on a relay whose path had gone seconds slow (its queue to a phone
+/// growing) while another relay's answered in a few hundred milliseconds (2026-10-30, minutes long).
+const PATH_RESELECT_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The time after which an idle [`RemoteStateActor`] stops.
 ///
 /// The actor only enters the idle state if no connections are active and no inbox senders exist
@@ -273,6 +278,8 @@ impl RemoteStateActor {
 
         let check_connections = time::interval(UPGRADE_INTERVAL);
         n0_future::pin!(check_connections);
+        let reselect = time::interval(PATH_RESELECT_INTERVAL);
+        n0_future::pin!(reselect);
 
         loop {
             let scheduled_path_open = match self.state.scheduled_open_path {
@@ -350,6 +357,9 @@ impl RemoteStateActor {
                 }
                 _ = check_connections.tick() => {
                     self.check_connections();
+                }
+                _ = reselect.tick(), if !self.connections.is_empty() => {
+                    self.select_path();
                 }
                 _ = &mut idle_timeout => {
                     if self.is_idle(&inbox) {

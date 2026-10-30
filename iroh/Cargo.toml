@@ -198,6 +198,11 @@ allowed_external_types = [
 name = "integration"
 path = "tests/integration.rs"
 
+[[test]]
+name = "relay_slow"
+path = "tests/relay_slow.rs"
+required-features = ["test-utils"]
+
 [[example]]
 name = "listen"
 required-features = []

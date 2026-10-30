@@ -22,6 +22,14 @@ const IPV6_RTT_ADVANTAGE: Duration = Duration::from_millis(3);
 /// happens when its biased RTT is at least this much better than the current path's.
 const RTT_SWITCHING_MIN: Duration = Duration::from_millis(5);
 
+/// ember: how much better a same-tier path's biased RTT must be for a switch to it: RTT_SWITCHING_MIN, or a quarter
+/// of the current path's, whichever is more. Paths are chosen again as their RTTs change (remote_state.rs
+/// PATH_RESELECT_INTERVAL), and two relays a few tens of milliseconds apart in jitter are not switched between each
+/// time; one gone seconds slower than another is left.
+fn switching_margin(current_biased: i128) -> i128 {
+    (RTT_SWITCHING_MIN.as_nanos() as i128).max(current_biased / 4)
+}
+
 /// Whether a transport is a primary path or a backup.
 ///
 /// Primary paths are used preferentially.  Backup paths are only used when no primary
@@ -176,7 +184,7 @@ impl PathSelector for BiasedRttPathSelector {
         if current_tier != best_tier {
             // Always switch across tiers (e.g. relay -> primary).
             selection.set(&best_psd);
-        } else if best_biased + RTT_SWITCHING_MIN.as_nanos() as i128 <= current_biased {
+        } else if best_biased + switching_margin(current_biased) <= current_biased {
             // For the same tier, only switch when biased RTT is meaningfully better.
             selection.set(&best_psd);
         }
@@ -301,6 +309,24 @@ mod tests {
         // 6ms diff > 5ms → switch.
         let chosen = select_with_default(Some(&v4_1), vec![psd(&v4_1, 20), psd(&v4_2, 14)]);
         assert_eq!(chosen.as_ref(), Some(&v4_2));
+    }
+
+    #[test]
+    fn same_tier_switches_by_a_quarter_of_a_slow_paths_rtt() {
+        let a = relay(1);
+        let b = relay(2);
+
+        // 300ms against 260ms: within a quarter of the current, kept.
+        let chosen = select_with_default(Some(&a), vec![psd(&a, 300), psd(&b, 260)]);
+        assert_eq!(chosen, None);
+
+        // 300ms against 200ms: switched.
+        let chosen = select_with_default(Some(&a), vec![psd(&a, 300), psd(&b, 200)]);
+        assert_eq!(chosen.as_ref(), Some(&b));
+
+        // A relay gone 11.9s slow (2026-10-30) against one at 255ms: switched.
+        let chosen = select_with_default(Some(&a), vec![psd(&a, 11_900), psd(&b, 255)]);
+        assert_eq!(chosen.as_ref(), Some(&b));
     }
 
     #[test]

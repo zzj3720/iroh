@@ -123,15 +123,23 @@ impl PathSelector for BiasedRttPathSelector {
         let current = ctx.current();
         let mut best: Option<(PathSelectionData<'_>, i128)> = None;
         let mut current_key: Option<i128> = None;
+        let mut current_seen = false;
+        let mut first = None;
 
         trace!("dumping path RTTs");
         for psd in ctx.paths() {
             let network_path = psd.network_path();
+            current_seen |= Some(network_path) == current;
+            if first.is_none() {
+                first = Some(psd.clone());
+            }
             // Skip paths whose stats can't be read (e.g. closed concurrently with select).
             let Some(stats) = psd.stats() else {
                 continue;
             };
-            let rtt = stats.rtt;
+            let Some(rtt) = stats.same_path_rtt else {
+                continue;
+            };
             trace!(%network_path, ?rtt);
             let key = self.sort_key(network_path, rtt);
 
@@ -144,7 +152,15 @@ impl PathSelector for BiasedRttPathSelector {
         }
 
         let mut selection = PathSelection::none();
+        // A live current path with no comparable measurement must not be replaced by a guess.
+        if current_seen && current_key.is_none() {
+            return selection;
+        }
         let Some((best_psd, best_biased)) = best else {
+            // A connection still needs an initial path before any RTT can be measured.
+            if !current_seen && let Some(first) = first {
+                selection.set(&first);
+            }
             return selection;
         };
 
@@ -204,6 +220,7 @@ mod tests {
         // PathStats is #[non_exhaustive], so build via Default + field assignment.
         let mut stats = PathStats::default();
         stats.rtt = Duration::from_millis(rtt_ms);
+        stats.same_path_rtt = Some(stats.rtt);
         PathSelectionData::for_test(addr, Some(stats))
     }
 
@@ -256,6 +273,21 @@ mod tests {
         // An IP route may itself go through an external tunnel or relay.
         let chosen = select_with_default(Some(&ip), vec![psd(&ip, 1000), psd(&relay, 50)]);
         assert_eq!(chosen.as_ref(), Some(&relay));
+    }
+
+    #[test]
+    fn unknown_current_rtt_is_not_compared_to_a_known_path() {
+        let ip = v4(1);
+        let relay = relay(1);
+        let unknown = PathSelectionData::for_test(&ip, Some(PathStats::default()));
+        assert_eq!(select_with_default(Some(&ip), vec![unknown, psd(&relay, 10)]), None);
+    }
+
+    #[test]
+    fn a_new_connection_can_start_without_rtt_samples() {
+        let ip = v4(1);
+        let unknown = PathSelectionData::for_test(&ip, Some(PathStats::default()));
+        assert_eq!(select_with_default(None, vec![unknown]).as_ref(), Some(&ip));
     }
 
     #[test]

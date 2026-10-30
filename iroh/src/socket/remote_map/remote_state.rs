@@ -831,7 +831,7 @@ impl RemoteStateActor {
                     .iter()
                     .filter_map(|(path_id, addr)| {
                         if addr.is_ip() {
-                            conn.path_stats(*path_id).map(|stats| stats.rtt)
+                            conn.path_stats(*path_id).and_then(|stats| stats.same_path_rtt)
                         } else {
                             None
                         }

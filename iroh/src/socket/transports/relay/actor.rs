@@ -432,9 +432,18 @@ impl ActiveRelayActor {
         .flatten()
     }
 
-    /// Keep a working entrance unless another is consistently better; a failed current entrance can be replaced at
-    /// once. This is per relay, not per station: both entrances arrive at the same relay and share its station leg.
+    /// Keep a working entrance unless another is consistently better. A missing probe is not evidence that the
+    /// existing connection has failed; `run` chooses a measured alternate if the connection itself fails.
+    /// This is per relay, not per station: both entrances arrive at the same relay and share its station leg.
     fn choose_entry(&mut self, samples: &[(RelayUrl, Duration)]) -> Option<RelayUrl> {
+        let Some(current) = samples
+            .iter()
+            .find(|(url, _)| *url == self.access)
+            .map(|(_, rtt)| *rtt)
+        else {
+            self.candidate = None;
+            return None;
+        };
         let (best, best_rtt) = samples
             .iter()
             .filter(|(url, _)| *url == self.url || self.entries.contains(url))
@@ -445,23 +454,17 @@ impl ActiveRelayActor {
             self.candidate = None;
             return None;
         }
-        let current = samples
-            .iter()
-            .find(|(url, _)| *url == self.access)
-            .map(|(_, rtt)| *rtt);
-        if let Some(current) = current {
-            if *best_rtt * 5 >= current * 4 {
-                self.candidate = None;
-                return None;
-            }
-            let count = match &self.candidate {
-                Some((url, count)) if url == best => count.saturating_add(1),
-                _ => 1,
-            };
-            self.candidate = Some((best.clone(), count));
-            if count < 2 && !first_comparison {
-                return None;
-            }
+        if *best_rtt * 5 >= current * 4 {
+            self.candidate = None;
+            return None;
+        }
+        let count = match &self.candidate {
+            Some((url, count)) if url == best => count.saturating_add(1),
+            _ => 1,
+        };
+        self.candidate = Some((best.clone(), count));
+        if count < 2 && !first_comparison {
+            return None;
         }
         self.candidate = None;
         Some(best.clone())
@@ -1898,6 +1901,55 @@ mod tests {
         .await
         .expect("overall timeout exceeded");
         Ok(())
+    }
+
+    /// A separate probe can fail even while the relay connection still carries traffic.  A measurement of only the
+    /// alternate entrance does not show that it is faster than the connection already in use.
+    #[tokio::test]
+    async fn missing_current_entry_sample_does_not_replace_it() {
+        let relay: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let entry: RelayUrl = "https://entry.example.com".parse().unwrap();
+        let (_prio_tx, prio_inbox_) = mpsc::channel(1);
+        let (_inbox_tx, inbox) = mpsc::channel(1);
+        let (_send_tx, relay_datagrams_send) = mpsc::channel(1);
+        let (relay_datagrams_recv, _recv_rx) = mpsc::channel(1);
+        let mut actor = ActiveRelayActor::new(ActiveRelayActorOptions {
+            url: relay.clone(),
+            entries: vec![entry.clone()],
+            prio_inbox_,
+            inbox,
+            relay_datagrams_send,
+            relay_datagrams_recv,
+            connection_opts: RelayConnectionOptions {
+                secret_key: SecretKey::generate(),
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                prefer_ipv6: Arc::new(AtomicBool::new(false)),
+                tls_config: CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .expect("infallible"),
+                auth_token: None,
+                udp: Default::default(),
+            },
+            stop_token: CancellationToken::new(),
+            metrics: Default::default(),
+            my_relay: Default::default(),
+        });
+
+        assert_eq!(
+            actor.choose_entry(&[(entry.clone(), Duration::from_millis(200))]),
+            None,
+            "a failed probe of the current entrance must not make the alternate win"
+        );
+        assert_eq!(actor.access, relay);
+        assert_eq!(
+            actor.choose_entry(&[
+                (relay.clone(), Duration::from_millis(50)),
+                (entry, Duration::from_millis(200))
+            ]),
+            None,
+            "a later comparison must keep the faster current entrance"
+        );
     }
 
     /// Two addresses really do lead to the same relay. Changing the entrance must preserve packet delivery, and

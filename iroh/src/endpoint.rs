@@ -1049,6 +1049,11 @@ impl Endpoint {
         self.inner.set_relay_udp(relay_udp).await;
     }
 
+    /// Replace the forwarding entrances for the endpoint's relays without closing its peer connections.
+    pub async fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
+        self.inner.set_relay_entries(entries).await;
+    }
+
     /// Adds the provided configuration to the [`RelayMap`].
     ///
     /// Replacing and returning any existing configuration for [`RelayUrl`].
@@ -1974,16 +1979,31 @@ fn proxy_url_from_env() -> Option<Url> {
 pub struct RelayStatus {
     url: RelayUrl,
     state: RelayConnectionState,
+    access: RelayUrl,
 }
 
 impl RelayStatus {
     pub(crate) fn new(url: RelayUrl, state: RelayConnectionState) -> Self {
-        Self { url, state }
+        Self {
+            access: url.clone(),
+            url,
+            state,
+        }
     }
 
     /// Returns the URL of the home relay.
     pub fn url(&self) -> &RelayUrl {
         &self.url
+    }
+
+    /// The address currently used to reach this relay, which may be a forwarding entry.
+    pub fn access_url(&self) -> &RelayUrl {
+        &self.access
+    }
+
+    pub(crate) fn with_access(mut self, access: RelayUrl) -> Self {
+        self.access = access;
+        self
     }
 
     /// Returns `true` if the endpoint is connected to the relay.
@@ -2608,6 +2628,180 @@ mod tests {
         Ok(())
     }
 
+    /// An entrance is added after a stream is open, disappears, then is removed. Both addresses terminate on the
+    /// same real relay. The stream and its connection must survive each change, including the loss of an entrance.
+    #[tokio::test]
+    #[traced_test]
+    async fn endpoint_relay_entry_changes_keep_stream() -> Result {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::{
+            net::{TcpListener, TcpStream},
+            task::JoinSet,
+        };
+
+        async fn proxy(
+            target: String,
+            allow: Arc<AtomicBool>,
+        ) -> Result<(RelayUrl, tokio::task::JoinHandle<()>)> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.anyerr()?;
+            let url = format!("https://{}", listener.local_addr().anyerr()?)
+                .parse()
+                .anyerr()?;
+            let task = tokio::spawn(async move {
+                let mut connections = JoinSet::new();
+                while let Ok((mut incoming, _)) = listener.accept().await {
+                    if allow.load(Ordering::Relaxed) {
+                        let target = target.clone();
+                        connections.spawn(async move {
+                            if let Ok(mut upstream) = TcpStream::connect(target).await {
+                                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut upstream)
+                                    .await;
+                            }
+                        });
+                    }
+                }
+            });
+            Ok((url, task))
+        }
+
+        let (server_map, relay, _relay_guard) = run_relay_server().await?;
+        let target = format!(
+            "{}:{}",
+            relay.host_str().unwrap(),
+            relay.port_or_known_default().unwrap()
+        );
+        let direct_allowed = Arc::new(AtomicBool::new(true));
+        let (direct, direct_task) = proxy(target.clone(), direct_allowed.clone()).await?;
+        let (entry, entry_task) = proxy(target.clone(), Arc::new(AtomicBool::new(true))).await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(server_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .clear_ip_transports()
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(RelayMap::from_iter([RelayConfig::from(
+                direct.clone(),
+            )])))
+            .home_on_every_relay()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .clear_ip_transports()
+            .bind()
+            .await?;
+        server.online().await;
+        client.online().await;
+        let echo = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.anyerr()?.await.anyerr()?;
+                let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
+                let mut buf = [0u8; 8];
+                while recv.read_exact(&mut buf).await.is_ok() {
+                    send.write_all(&buf).await.anyerr()?;
+                }
+                Ok::<_, Error>(())
+            }
+        });
+        let conn = client
+            .connect(
+                EndpointAddr::new(server.id()).with_relay_url(direct.clone()),
+                TEST_ALPN,
+            )
+            .await?;
+        let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+        let mut n = 0u64;
+        let mut round = async |send: &mut crate::endpoint::SendStream,
+                               recv: &mut crate::endpoint::RecvStream|
+               -> Result {
+            n += 1;
+            send.write_all(&n.to_be_bytes()).await.anyerr()?;
+            let mut buf = [0u8; 8];
+            time::timeout(Duration::from_secs(20), recv.read_exact(&mut buf))
+                .await
+                .anyerr()?
+                .anyerr()?;
+            assert_eq!(u64::from_be_bytes(buf), n);
+            Ok(())
+        };
+        round(&mut send, &mut recv).await?;
+        let mut status = client.home_relay_status();
+        // Existing direct connections continue; only fresh probes fail. This makes the test select the entry without
+        // relying on the machine's timing or waiting for a periodic comparison.
+        direct_allowed.store(false, Ordering::Relaxed);
+        client
+            .set_relay_entries(vec![(direct.clone(), vec![entry.clone()])])
+            .await;
+        time::timeout(Duration::from_secs(20), async {
+            while !status
+                .get()
+                .iter()
+                .any(|s| s.is_connected() && s.access_url() == &entry)
+            {
+                status.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .anyerr()?;
+        round(&mut send, &mut recv).await?;
+
+        // Losing that entrance should reopen the direct route and preserve the same QUIC stream.
+        direct_allowed.store(true, Ordering::Relaxed);
+        entry_task.abort();
+        time::timeout(Duration::from_secs(20), async {
+            while !status
+                .get()
+                .iter()
+                .any(|s| s.is_connected() && s.access_url() == &direct)
+            {
+                status.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .anyerr()?;
+        round(&mut send, &mut recv).await?;
+        assert!(conn.close_reason().is_none());
+
+        let (next_entry, next_entry_task) = proxy(target, Arc::new(AtomicBool::new(true))).await?;
+        direct_allowed.store(false, Ordering::Relaxed);
+        client
+            .set_relay_entries(vec![(direct.clone(), vec![next_entry.clone()])])
+            .await;
+        time::timeout(Duration::from_secs(20), async {
+            while !status
+                .get()
+                .iter()
+                .any(|s| s.is_connected() && s.access_url() == &next_entry)
+            {
+                status.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .anyerr()?;
+        round(&mut send, &mut recv).await?;
+        direct_allowed.store(true, Ordering::Relaxed);
+        client.set_relay_entries(vec![]).await;
+        time::timeout(Duration::from_secs(20), async {
+            while !status
+                .get()
+                .iter()
+                .any(|s| s.is_connected() && s.access_url() == &direct)
+            {
+                status.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .anyerr()?;
+        round(&mut send, &mut recv).await?;
+        conn.close(0u32.into(), b"done");
+        echo.abort();
+        direct_task.abort();
+        next_entry_task.abort();
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
     /// ember: the relays' UDP way switched on and off while connected (`Endpoint::set_relay_udp`): each relay link is
     /// dialed again, the connection and its stream going on, its datagrams then over UDP (the relay's UDP counters go
     /// up) and then not.
@@ -2831,7 +3025,11 @@ mod tests {
             .expect("a selected path");
         info!(?selected, "taking its relay away");
         let gone_a = selected == TransportAddr::Relay(url_a.clone());
-        let (gone, kept) = if gone_a { (relay_a, relay_b) } else { (relay_b, relay_a) };
+        let (gone, kept) = if gone_a {
+            (relay_a, relay_b)
+        } else {
+            (relay_b, relay_a)
+        };
         gone.shutdown().await.anyerr()?;
         let started = time::Instant::now();
         let mut slowest = Duration::ZERO;

@@ -715,6 +715,12 @@ impl NetworkChangeSender {
         }
     }
 
+    pub(crate) fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
+        for relay in &self.relay {
+            relay.set_relay_entries(entries.clone());
+        }
+    }
+
     /// Rebinds underlying connections, if necessary.
     pub(crate) fn rebind(&self) -> std::io::Result<()> {
         let mut res = Ok(());
@@ -1231,7 +1237,6 @@ impl TransportsSender {
             tokio_stream::wrappers::ReceiverStream::new(receiver).map(|_| ()),
         )
     }
-
 
     #[instrument(name = "poll_send", skip(self, cx, transmit), fields(len = transmit.contents.len()))]
     pub(crate) fn poll_send(

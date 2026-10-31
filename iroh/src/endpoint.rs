@@ -2636,32 +2636,41 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::{
             net::{TcpListener, TcpStream},
+            sync::mpsc,
             task::JoinSet,
         };
 
         async fn proxy(
             target: String,
             allow: Arc<AtomicBool>,
-        ) -> Result<(RelayUrl, tokio::task::JoinHandle<()>)> {
+        ) -> Result<(RelayUrl, tokio::task::JoinHandle<()>, mpsc::Sender<()>)> {
             let listener = TcpListener::bind("127.0.0.1:0").await.anyerr()?;
             let url = format!("https://{}", listener.local_addr().anyerr()?)
                 .parse()
                 .anyerr()?;
+            let (drop_tx, mut drop_rx) = mpsc::channel(1);
             let task = tokio::spawn(async move {
                 let mut connections = JoinSet::new();
-                while let Ok((mut incoming, _)) = listener.accept().await {
-                    if allow.load(Ordering::Relaxed) {
-                        let target = target.clone();
-                        connections.spawn(async move {
-                            if let Ok(mut upstream) = TcpStream::connect(target).await {
-                                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut upstream)
-                                    .await;
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let Ok((mut incoming, _)) = accepted else { break };
+                            if allow.load(Ordering::Relaxed) {
+                                let target = target.clone();
+                                connections.spawn(async move {
+                                    if let Ok(mut upstream) = TcpStream::connect(target).await {
+                                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut upstream)
+                                            .await;
+                                    }
+                                });
                             }
-                        });
+                        }
+                        Some(()) = drop_rx.recv() => connections.abort_all(),
+                        else => break,
                     }
                 }
             });
-            Ok((url, task))
+            Ok((url, task, drop_tx))
         }
 
         let (server_map, relay, _relay_guard) = run_relay_server().await?;
@@ -2671,8 +2680,10 @@ mod tests {
             relay.port_or_known_default().unwrap()
         );
         let direct_allowed = Arc::new(AtomicBool::new(true));
-        let (direct, direct_task) = proxy(target.clone(), direct_allowed.clone()).await?;
-        let (entry, entry_task) = proxy(target.clone(), Arc::new(AtomicBool::new(true))).await?;
+        let (direct, direct_task, drop_direct) =
+            proxy(target.clone(), direct_allowed.clone()).await?;
+        let (entry, entry_task, _drop_entry) =
+            proxy(target.clone(), Arc::new(AtomicBool::new(true))).await?;
         let server = Endpoint::builder(presets::Minimal)
             .alpns(vec![TEST_ALPN.to_vec()])
             .relay_mode(RelayMode::Custom(server_map))
@@ -2726,12 +2737,12 @@ mod tests {
         };
         round(&mut send, &mut recv).await?;
         let mut status = client.home_relay_status();
-        // Existing direct connections continue; only fresh probes fail. This makes the test select the entry without
-        // relying on the machine's timing or waiting for a periodic comparison.
+        // An entrance that has really gone is replaced by an alternate without losing the stream.
         direct_allowed.store(false, Ordering::Relaxed);
         client
             .set_relay_entries(vec![(direct.clone(), vec![entry.clone()])])
             .await;
+        drop_direct.send(()).await.anyerr()?;
         time::timeout(Duration::from_secs(20), async {
             while !status
                 .get()
@@ -2762,11 +2773,13 @@ mod tests {
         round(&mut send, &mut recv).await?;
         assert!(conn.close_reason().is_none());
 
-        let (next_entry, next_entry_task) = proxy(target, Arc::new(AtomicBool::new(true))).await?;
+        let (next_entry, next_entry_task, _drop_next_entry) =
+            proxy(target, Arc::new(AtomicBool::new(true))).await?;
         direct_allowed.store(false, Ordering::Relaxed);
         client
             .set_relay_entries(vec![(direct.clone(), vec![next_entry.clone()])])
             .await;
+        drop_direct.send(()).await.anyerr()?;
         time::timeout(Duration::from_secs(20), async {
             while !status
                 .get()

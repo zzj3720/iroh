@@ -1336,6 +1336,25 @@ impl EndpointInner {
         }
     }
 
+    /// Change the entrances to existing relays, including actors already connected to them.
+    pub(crate) async fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
+        for url in self.relay_map.urls::<Vec<RelayUrl>>() {
+            if let Some(config) = self.relay_map.get(&url) {
+                let routes = entries
+                    .iter()
+                    .find(|(relay, _)| relay == &url)
+                    .map(|(_, urls)| urls.clone())
+                    .unwrap_or_default();
+                self.relay_map
+                    .insert(url, Arc::new(config.as_ref().clone().with_entries(routes)));
+            }
+        }
+        self.actor_sender
+            .send(ActorMessage::RelayEntriesChange(entries))
+            .await
+            .ok();
+    }
+
     #[cfg(all(test, with_crypto_provider))]
     async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
@@ -1437,6 +1456,8 @@ enum ActorMessage {
     DirectAddrRefresh,
     /// ember: every relay link dialed again (`Endpoint::set_relay_udp`).
     ReconnectRelays,
+    /// Forwarding entrances changed, without a change to the relay identities.
+    RelayEntriesChange(Vec<(RelayUrl, Vec<RelayUrl>)>),
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
@@ -1828,6 +1849,9 @@ impl Actor {
             }
             ActorMessage::ReconnectRelays => {
                 self.transports_network_change.reconnect_relays();
+            }
+            ActorMessage::RelayEntriesChange(entries) => {
+                self.transports_network_change.set_relay_entries(entries);
             }
             ActorMessage::ResolveRemote(addr, tx) => {
                 self.remote_map.resolve_remote(addr, tx).await;

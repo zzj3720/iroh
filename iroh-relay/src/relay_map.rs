@@ -243,6 +243,10 @@ pub struct RelayConfig {
     /// Set via [`RelayConfig::with_auth_token`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// Other addresses which lead to this same relay server. They are access routes, not independent relays:
+    /// connecting to more than one at once with the same endpoint ID would displace the older connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<RelayUrl>,
 }
 
 impl RelayConfig {
@@ -252,6 +256,7 @@ impl RelayConfig {
             url,
             quic,
             auth_token: None,
+            entries: Vec::new(),
         }
     }
 
@@ -267,6 +272,12 @@ impl RelayConfig {
         self.auth_token = Some(token.into());
         self
     }
+
+    /// Adds other addresses that forward to this relay, to be considered beside its own address.
+    pub fn with_entries(mut self, entries: impl IntoIterator<Item = RelayUrl>) -> Self {
+        self.entries = entries.into_iter().filter(|url| url != &self.url).collect();
+        self
+    }
 }
 
 impl From<RelayUrl> for RelayConfig {
@@ -275,6 +286,7 @@ impl From<RelayUrl> for RelayConfig {
             url: value,
             quic: quic_config(),
             auth_token: None,
+            entries: Vec::new(),
         }
     }
 }

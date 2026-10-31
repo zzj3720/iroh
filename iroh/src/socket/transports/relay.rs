@@ -248,6 +248,10 @@ impl RelayNetworkChangeSender {
         self.send_relay_actor(RelayActorMessage::Reconnect);
     }
 
+    pub(super) fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
+        self.send_relay_actor(RelayActorMessage::SetEntries(entries));
+    }
+
     pub(super) fn rebind(&self) -> io::Result<()> {
         self.send_relay_actor(RelayActorMessage::MaybeCloseRelaysOnRebind);
 
@@ -290,7 +294,6 @@ impl RelaySender {
             receiver,
         )
     }
-
 
     /// ember: whether `url` is one of this transport's relays.
     pub(super) fn owns(&self, url: &RelayUrl) -> bool {

@@ -47,7 +47,7 @@ use iroh_relay::{
 use n0_error::{AnyError, e, stack_error};
 use n0_future::{
     FuturesUnorderedBounded, MaybeFuture, SinkExt, StreamExt,
-    task::JoinSet,
+    task::{self, AbortOnDropHandle, JoinSet},
     time::{self, Duration, Instant, MissedTickBehavior},
 };
 use n0_watcher::Watchable;
@@ -82,6 +82,9 @@ const SEND_DATAGRAM_BATCH_SIZE: usize = 20;
 /// This includes DNS, dialing the server, upgrading the connection, and completing the
 /// handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Recheck alternate entrances to one relay without registering the endpoint's key on it twice.
+const ENTRY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Time after which the [`ActiveRelayActor`] will drop undeliverable datagrams.
 ///
@@ -137,6 +140,15 @@ struct ActiveRelayActor {
     url: RelayUrl,
     /// Builder which can repeatedly build a relay client.
     relay_client_builder: relay::client::ClientBuilder,
+    /// The address the existing relay connection uses, and the options for dialing another entrance.
+    access: RelayUrl,
+    connection_opts: RelayConnectionOptions,
+    entries: Vec<RelayUrl>,
+    candidate: Option<(RelayUrl, u8)>,
+    has_compared: bool,
+    last_samples: Vec<(RelayUrl, Duration)>,
+    probe_now: Arc<tokio::sync::Notify>,
+    _entry_probes: Option<AbortOnDropHandle<()>>,
     /// ember: whether the relay's UDP way is asked for, read at each dial.
     udp: Arc<AtomicBool>,
     /// Whether or not this is the home relay server.
@@ -169,6 +181,10 @@ enum ActiveRelayMessage {
     CheckConnection { local_ips: Vec<IpAddr> },
     /// Sets this relay as the home relay, or not.
     SetHomeRelay(bool),
+    /// Recent round trips to this relay over each of its possible entrances.
+    EntrySamples(Vec<(RelayUrl, Duration)>),
+    /// Entrances changed while the relay connection is already running.
+    UpdateEntries(Vec<RelayUrl>, mpsc::Sender<ActiveRelayMessage>),
     /// ember: the link dialed again (`Endpoint::set_relay_udp`); none is dialed while not connected.
     Reconnect,
     #[cfg(test)]
@@ -197,6 +213,7 @@ struct ActiveRelayActorOptions {
     relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
     relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
     connection_opts: RelayConnectionOptions,
+    entries: Vec<RelayUrl>,
     stop_token: CancellationToken,
     metrics: Arc<SocketMetrics>,
     my_relay: HomeRelayWatch,
@@ -273,19 +290,28 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             relay_datagrams_recv,
             connection_opts,
+            entries,
             stop_token,
             metrics,
             my_relay,
         } = opts;
         let udp = connection_opts.udp.clone();
-        let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts);
+        let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts.clone());
         ActiveRelayActor {
             prio_inbox,
             inbox,
             relay_datagrams_recv,
             relay_datagrams_send,
+            access: url.clone(),
             url,
             relay_client_builder,
+            connection_opts,
+            entries,
+            candidate: None,
+            has_compared: false,
+            last_samples: Vec::new(),
+            probe_now: Arc::new(tokio::sync::Notify::new()),
+            _entry_probes: None,
             udp,
             is_home_relay: false,
             inactive_timeout: Box::pin(time::sleep(RELAY_INACTIVE_CLEANUP_TIME)),
@@ -329,6 +355,139 @@ impl ActiveRelayActor {
         builder
     }
 
+    /// Compare entrances using short-lived, distinct identities. A probe using our endpoint's identity would make the
+    /// relay deactivate its live connection, even though the entrance and the relay have different URLs.
+    fn start_entry_probes(&mut self, sender: mpsc::Sender<ActiveRelayMessage>) {
+        self._entry_probes = None;
+        if self.entries.is_empty() {
+            return;
+        }
+        let mut urls = vec![self.url.clone()];
+        for entry in &self.entries {
+            if !urls.contains(entry) {
+                urls.push(entry.clone());
+            }
+        }
+        let opts = self.connection_opts.clone();
+        let probe_now = self.probe_now.clone();
+        self._entry_probes = Some(AbortOnDropHandle::new(task::spawn(async move {
+            loop {
+                let attempts = urls.iter().cloned().map(|url| {
+                    let opts = opts.clone();
+                    async move { Self::probe_entry(url, opts).await }
+                });
+                let mut pending = FuturesUnorderedBounded::from_iter(attempts);
+                let mut samples = Vec::new();
+                while let Some(sample) = pending.next().await {
+                    if let Some(sample) = sample {
+                        samples.push(sample);
+                    }
+                }
+                if sender
+                    .send(ActiveRelayMessage::EntrySamples(samples))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::select! {
+                    _ = time::sleep(ENTRY_PROBE_INTERVAL) => {},
+                    _ = probe_now.notified() => {},
+                }
+            }
+        })));
+    }
+
+    async fn probe_entry(
+        url: RelayUrl,
+        mut opts: RelayConnectionOptions,
+    ) -> Option<(RelayUrl, Duration)> {
+        opts.secret_key = SecretKey::generate();
+        let builder = Self::create_relay_builder(url.clone(), opts);
+        time::timeout(CONNECT_TIMEOUT, async move {
+            let client = builder.connect().await.ok()?;
+            let (mut stream, mut sink) = client.split();
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let ping: [u8; 8] = rand::random();
+                let started = Instant::now();
+                sink.send(ClientToRelayMsg::Ping(ping)).await.ok()?;
+                loop {
+                    match stream.next().await? {
+                        Ok(RelayToClientMsg::Pong(got)) if got == ping => {
+                            samples.push(started.elapsed());
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return None,
+                    }
+                }
+            }
+            samples.sort();
+            let _ = sink.close().await;
+            Some((url, samples[1]))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Keep a working entrance unless another is consistently better; a failed current entrance can be replaced at
+    /// once. This is per relay, not per station: both entrances arrive at the same relay and share its station leg.
+    fn choose_entry(&mut self, samples: &[(RelayUrl, Duration)]) -> Option<RelayUrl> {
+        let (best, best_rtt) = samples
+            .iter()
+            .filter(|(url, _)| *url == self.url || self.entries.contains(url))
+            .min_by_key(|(_, rtt)| *rtt)?;
+        let first_comparison = !self.has_compared;
+        self.has_compared = true;
+        if *best == self.access {
+            self.candidate = None;
+            return None;
+        }
+        let current = samples
+            .iter()
+            .find(|(url, _)| *url == self.access)
+            .map(|(_, rtt)| *rtt);
+        if let Some(current) = current {
+            if *best_rtt * 5 >= current * 4 {
+                self.candidate = None;
+                return None;
+            }
+            let count = match &self.candidate {
+                Some((url, count)) if url == best => count.saturating_add(1),
+                _ => 1,
+            };
+            self.candidate = Some((best.clone(), count));
+            if count < 2 && !first_comparison {
+                return None;
+            }
+        }
+        self.candidate = None;
+        Some(best.clone())
+    }
+
+    fn set_access(&mut self, access: RelayUrl) {
+        self.relay_client_builder =
+            Self::create_relay_builder(access.clone(), self.connection_opts.clone());
+        self.my_relay.set_access(&self.url, access.clone());
+        self.access = access;
+    }
+
+    fn update_entries(
+        &mut self,
+        entries: Vec<RelayUrl>,
+        sender: mpsc::Sender<ActiveRelayMessage>,
+    ) -> bool {
+        self.entries = entries;
+        self.candidate = None;
+        self.has_compared = false;
+        self.last_samples
+            .retain(|(url, _)| *url == self.url || self.entries.contains(url));
+        self.start_entry_probes(sender);
+        self.access != self.url && !self.entries.contains(&self.access)
+    }
+
     /// The main actor run loop.
     ///
     /// Primarily switches between the dialing and connected states.
@@ -341,6 +500,23 @@ impl ActiveRelayActor {
             let last_error = Some(Arc::new(AnyError::from(err)));
             self.my_relay
                 .set_status(&self.url, RelayConnectionState::Disconnected { last_error });
+            // A dead entrance should not hold the connection until the next periodic measurement. Try an entrance
+            // that answered the last measurement and start a fresh comparison in case the network has changed.
+            let alternate = if self.access != self.url && !self.entries.contains(&self.access) {
+                Some(self.url.clone())
+            } else {
+                self.last_samples
+                    .iter()
+                    .filter(|(url, _)| {
+                        *url != self.access && (*url == self.url || self.entries.contains(url))
+                    })
+                    .min_by_key(|(_, rtt)| *rtt)
+                    .map(|(url, _)| url.clone())
+            };
+            if let Some(access) = alternate {
+                self.set_access(access);
+            }
+            self.probe_now.notify_one();
             if !was_established {
                 // If dialing failed, or if the relay connection failed before we received a pong,
                 // we wait an exponentially increasing time until we attempt to reconnect again.
@@ -376,15 +552,22 @@ impl ActiveRelayActor {
     async fn run_once(&mut self) -> Result<(), RelayConnectionError> {
         self.my_relay
             .set_status(&self.url, RelayConnectionState::Connecting);
-        let client = match self.run_dialing().instrument(info_span!("dialing")).await {
+        let mut client = match self.run_dialing().instrument(info_span!("dialing")).await {
             Some(client_res) => client_res.map_err(|err| e!(RelayConnectionError::Dial, err))?,
             None => return Ok(()),
         };
         self.my_relay
             .set_status(&self.url, RelayConnectionState::Connected);
-        self.run_connected(client)
-            .instrument(info_span!("connected"))
-            .await
+        loop {
+            match self
+                .run_connected(client)
+                .instrument(info_span!("connected"))
+                .await?
+            {
+                Some(next) => client = next,
+                None => return Ok(()),
+            }
+        }
     }
 
     fn reset_inactive_timeout(&mut self) {
@@ -461,6 +644,19 @@ impl ActiveRelayActor {
                         ActiveRelayMessage::SetHomeRelay(is_home) => {
                             self.set_home_relay(is_home);
                         }
+                        ActiveRelayMessage::EntrySamples(samples) => {
+                            self.last_samples = samples.clone();
+                            if let Some(access) = self.choose_entry(&samples) {
+                                self.set_access(access);
+                                dialing_fut.set(self.dial_relay());
+                            }
+                        }
+                        ActiveRelayMessage::UpdateEntries(entries, sender) => {
+                            if self.update_entries(entries, sender) {
+                                self.set_access(self.url.clone());
+                                dialing_fut.set(self.dial_relay());
+                            }
+                        }
                         ActiveRelayMessage::CheckConnection { .. } | ActiveRelayMessage::Reconnect => {}
                         #[cfg(test)]
                         ActiveRelayMessage::GetLocalAddr(sender) => {
@@ -512,6 +708,26 @@ impl ActiveRelayActor {
         }
     }
 
+    /// Connect another entrance before releasing the current socket. The relay makes the new socket active only once
+    /// it authenticates; the old one is then closed, so the same identity does not keep displacing itself.
+    fn dial_entry(
+        &self,
+        access: RelayUrl,
+    ) -> impl Future<Output = Result<Client, DialError>> + use<> {
+        let builder = Self::create_relay_builder(access, self.connection_opts.clone());
+        #[cfg(not(wasm_browser))]
+        let builder = builder.udp(self.udp.load(Ordering::Relaxed));
+        async move {
+            match time::timeout(CONNECT_TIMEOUT, builder.connect()).await {
+                Ok(Ok(client)) => Ok(client),
+                Ok(Err(err)) => Err(e!(DialError::Connect, err)),
+                Err(_) => Err(e!(DialError::Timeout {
+                    timeout: CONNECT_TIMEOUT
+                })),
+            }
+        }
+    }
+
     /// Runs the actor loop when connected to a relay server.
     ///
     /// Returns `Ok` if the actor needs to shut down.  `Err` is returned if the connection
@@ -519,7 +735,7 @@ impl ActiveRelayActor {
     async fn run_connected(
         &mut self,
         client: iroh_relay::client::Client,
-    ) -> Result<(), RelayConnectionError> {
+    ) -> Result<Option<Client>, RelayConnectionError> {
         trace!("Actor loop: connected to relay");
         event!(
             target: "iroh::_events::relay::connected",
@@ -548,6 +764,8 @@ impl ActiveRelayActor {
         // The first ping will be sent immediately.
         let mut ping_interval = time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut replacement = std::pin::pin!(MaybeFuture::None);
+        let mut replacement_access: Option<RelayUrl> = None;
 
         let res = loop {
             if let Some(data) = state.pong_pending.take() {
@@ -559,12 +777,12 @@ impl ActiveRelayActor {
                 biased;
                 _ = self.stop_token.cancelled() => {
                     debug!("Shutdown.");
-                    break Ok(());
+                    break Ok(None);
                 }
                 msg = self.prio_inbox.recv() => {
                     let Some(msg) = msg else {
                         warn!("Priority inbox closed, shutdown.");
-                        break Ok(());
+                        break Ok(None);
                     };
                     match msg {
                         ActiveRelayPrioMessage::HasEndpointRoute(peer, sender) => {
@@ -584,7 +802,7 @@ impl ActiveRelayActor {
                 msg = self.inbox.recv() => {
                     let Some(msg) = msg else {
                         warn!("Inbox closed, shutdown.");
-                        break Ok(());
+                        break Ok(None);
                     };
                     match msg {
                         ActiveRelayMessage::SetHomeRelay(is_home) => {
@@ -596,6 +814,28 @@ impl ActiveRelayActor {
                             if is_home {
                                 self.my_relay
                                     .set_status(&self.url, RelayConnectionState::Connected);
+                                self.my_relay.set_access(&self.url, self.access.clone());
+                            }
+                        }
+                        ActiveRelayMessage::EntrySamples(samples) => {
+                            self.last_samples = samples.clone();
+                            if replacement.is_none() {
+                                if let Some(access) = self.choose_entry(&samples) {
+                                    replacement.as_mut().set_future(self.dial_entry(access.clone()));
+                                    replacement_access = Some(access);
+                                }
+                            }
+                        }
+                        ActiveRelayMessage::UpdateEntries(entries, sender) => {
+                            let needs_default = self.update_entries(entries, sender);
+                            if replacement_access.as_ref().is_some_and(|access| *access != self.url && !self.entries.contains(access)) {
+                                replacement.as_mut().set_none();
+                                replacement_access = None;
+                            }
+                            if needs_default && replacement.is_none() {
+                                let access = self.url.clone();
+                                replacement.as_mut().set_future(self.dial_entry(access.clone()));
+                                replacement_access = Some(access);
                             }
                         }
                         ActiveRelayMessage::Reconnect => break Err(e!(RunError::Reconnect)),
@@ -624,13 +864,26 @@ impl ActiveRelayActor {
                         }
                     }
                 }
+                result = &mut replacement, if replacement.is_some() => {
+                    replacement.as_mut().set_none();
+                    match result {
+                        Ok(client) => {
+                            self.set_access(replacement_access.take().expect("entry dial has an address"));
+                            break Ok(Some(client));
+                        }
+                        Err(err) => {
+                            debug!("alternate relay entrance failed: {err:#}");
+                            replacement_access = None;
+                        }
+                    }
+                }
                 count = self.relay_datagrams_send.recv_many(
                     &mut send_datagrams_buf,
                     SEND_DATAGRAM_BATCH_SIZE,
                 ) => {
                     if count == 0 {
                         warn!("Datagram inbox closed, shutdown");
-                        break Ok(());
+                        break Ok(None);
                     };
                     self.reset_inactive_timeout();
                     // TODO(frando): can we avoid the clone here?
@@ -661,12 +914,12 @@ impl ActiveRelayActor {
                 }
                 _ = &mut self.inactive_timeout, if !self.is_home_relay => {
                     debug!("Inactive for {RELAY_INACTIVE_CLEANUP_TIME:?}, exiting (running).");
-                    break Ok(());
+                    break Ok(None);
                 }
             }
         };
 
-        if res.is_ok()
+        if matches!(res, Ok(None))
             && let Err(err) = client_sink.close().await
         {
             debug!("Failed to close client sink gracefully: {err:#}");
@@ -848,6 +1101,7 @@ pub(super) enum RelayActorMessage {
     MaybeCloseRelaysOnRebind,
     /// ember: every active relay's link dialed again.
     Reconnect,
+    SetEntries(Vec<(RelayUrl, Vec<RelayUrl>)>),
     NetworkChange {
         report: Report,
     },
@@ -879,6 +1133,7 @@ pub(super) struct RelayActor {
     active_relays: BTreeMap<RelayUrl, ActiveRelayHandle>,
     /// The tasks for the [`ActiveRelayActor`]s in `active_relays` above.
     active_relay_tasks: JoinSet<()>,
+    entry_overrides: Option<BTreeMap<RelayUrl, Vec<RelayUrl>>>,
     cancel_token: CancellationToken,
 }
 
@@ -1005,8 +1260,17 @@ impl HomeRelayWatch {
     /// updates the URL in the watchable *before* sending `SetHomeRelay(false)`, so by
     /// the time the old actor tries to write, the URL no longer matches.
     fn set_status(&self, url: &RelayUrl, state: RelayConnectionState) {
-        if self.inner.get().as_ref().map(RelayStatus::url) == Some(url) {
-            let _ = self.inner.set(Some(RelayStatus::new(url.clone(), state)));
+        if let Some(current) = self.inner.get().filter(|s| s.url() == url) {
+            let _ = self.inner.set(Some(
+                RelayStatus::new(url.clone(), state).with_access(current.access_url().clone()),
+            ));
+        }
+    }
+
+    /// The address carrying this relay connection, while this relay is still the home one.
+    fn set_access(&self, url: &RelayUrl, access: RelayUrl) {
+        if let Some(current) = self.inner.get().filter(|s| s.url() == url) {
+            let _ = self.inner.set(Some(current.with_access(access)));
         }
     }
 
@@ -1030,6 +1294,7 @@ impl RelayActor {
             relay_datagram_recv_queue,
             active_relays: Default::default(),
             active_relay_tasks: JoinSet::new(),
+            entry_overrides: None,
             cancel_token,
         }
     }
@@ -1124,6 +1389,21 @@ impl RelayActor {
                         .await
                         .ok();
                 }
+            }
+            RelayActorMessage::SetEntries(entries) => {
+                let entries: BTreeMap<_, _> = entries.into_iter().collect();
+                for (url, handle) in &self.active_relays {
+                    let list = entries.get(url).cloned().unwrap_or_default();
+                    handle
+                        .inbox_addr
+                        .send(ActiveRelayMessage::UpdateEntries(
+                            list,
+                            handle.inbox_addr.clone(),
+                        ))
+                        .await
+                        .ok();
+                }
+                self.entry_overrides = Some(entries);
             }
             RelayActorMessage::CheckConnectionAfterNetworkChange => {
                 self.check_connection_after_network_change().await;
@@ -1301,11 +1581,15 @@ impl RelayActor {
     fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
         debug!(?url, "Adding relay connection");
 
-        let auth_token = self
-            .config
-            .relay_map
-            .get(&url)
-            .and_then(|cfg| cfg.auth_token.clone());
+        let relay_config = self.config.relay_map.get(&url);
+        let auth_token = relay_config.as_ref().and_then(|cfg| cfg.auth_token.clone());
+        let entries = match &self.entry_overrides {
+            Some(overrides) => overrides.get(&url).cloned().unwrap_or_default(),
+            None => relay_config
+                .as_ref()
+                .map(|cfg| cfg.entries.clone())
+                .unwrap_or_default(),
+        };
         let connection_opts = RelayConnectionOptions {
             secret_key: self.config.secret_key.clone(),
             #[cfg(not(wasm_browser))]
@@ -1329,11 +1613,13 @@ impl RelayActor {
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
+            entries,
             stop_token: self.cancel_token.child_token(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
         };
-        let actor = ActiveRelayActor::new(opts);
+        let mut actor = ActiveRelayActor::new(opts);
+        actor.start_entry_probes(inbox_tx.clone());
         self.active_relay_tasks.spawn(
             async move {
                 actor.run().await;
@@ -1468,14 +1754,15 @@ mod tests {
     };
     use n0_error::{AnyError as Error, Result, StackResultExt, StdResultExt};
     use n0_tracing_test::traced_test;
+    use n0_watcher::Watcher;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
     use tracing::{Instrument, info, info_span};
 
     use super::{
         ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
-        RELAY_INACTIVE_CLEANUP_TIME, RelayConnectionOptions, RelayRecvDatagram, RelaySendItem,
-        UNDELIVERABLE_DATAGRAM_TIMEOUT,
+        HomeRelayWatch, RELAY_INACTIVE_CLEANUP_TIME, RelayConnectionOptions, RelayConnectionState,
+        RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
     };
     use crate::{dns::DnsResolver, test_utils};
 
@@ -1493,6 +1780,7 @@ mod tests {
     ) -> AbortOnDropHandle<()> {
         let opts = ActiveRelayActorOptions {
             url,
+            entries: Vec::new(),
             prio_inbox_: prio_inbox_rx,
             inbox: inbox_rx,
             relay_datagrams_send,
@@ -1609,6 +1897,113 @@ mod tests {
         })
         .await
         .expect("overall timeout exceeded");
+        Ok(())
+    }
+
+    /// Two addresses really do lead to the same relay. Changing the entrance must preserve packet delivery, and
+    /// closing the superseded socket must not leave it fighting the replacement for the endpoint's identity.
+    #[tokio::test]
+    #[traced_test]
+    async fn relay_entry_handover_keeps_forwarding() -> Result {
+        let (_map, relay, _server) = test_utils::run_relay_server().await?;
+        let target = format!(
+            "{}:{}",
+            relay.host_str().unwrap(),
+            relay.port_or_known_default().unwrap()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .std_context("bind forwarding entry")?;
+        let entry: RelayUrl = format!(
+            "https://{}",
+            listener.local_addr().std_context("entry address")?
+        )
+        .parse()
+        .std_context("entry URL")?;
+        let proxy = tokio::spawn(async move {
+            while let Ok((mut incoming, _)) = listener.accept().await {
+                let target = target.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut upstream).await;
+                    }
+                });
+            }
+        });
+        let _proxy = AbortOnDropHandle::new(proxy);
+        let (peer, _echo) = start_echo_endpoint(relay.clone());
+        let (recv_tx, mut recv_rx) = mpsc::channel(16);
+        let (send_tx, send_rx) = mpsc::channel(16);
+        let (_prio_tx, prio_rx) = mpsc::channel(8);
+        let (inbox_tx, inbox_rx) = mpsc::channel(16);
+        let watch = HomeRelayWatch::default();
+        watch.set(relay.clone(), RelayConnectionState::Connecting);
+        let opts = ActiveRelayActorOptions {
+            url: relay.clone(),
+            entries: vec![entry.clone()],
+            prio_inbox_: prio_rx,
+            inbox: inbox_rx,
+            relay_datagrams_send: send_rx,
+            relay_datagrams_recv: recv_tx,
+            connection_opts: RelayConnectionOptions {
+                secret_key: SecretKey::generate(),
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                prefer_ipv6: Arc::new(AtomicBool::new(false)),
+                tls_config: CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .expect("infallible"),
+                auth_token: None,
+                udp: Default::default(),
+            },
+            stop_token: CancellationToken::new(),
+            metrics: Default::default(),
+            my_relay: watch.clone(),
+        };
+        let _actor = AbortOnDropHandle::new(tokio::spawn(ActiveRelayActor::new(opts).run()));
+        let packet = RelaySendItem {
+            remote_endpoint: peer,
+            url: relay.clone(),
+            datagrams: Datagrams::from(b"still connected"),
+        };
+        send_recv_echo(packet.clone(), &send_tx, &mut recv_rx).await?;
+        let mut updates = watch.watch();
+        inbox_tx
+            .send(ActiveRelayMessage::EntrySamples(vec![
+                (relay.clone(), Duration::from_millis(200)),
+                (entry.clone(), Duration::from_millis(20)),
+            ]))
+            .await
+            .std_context("send entry measurements")?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while updates.get().as_ref().map(|s| s.access_url()) != Some(&entry) {
+                updates.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .std_context("entry was selected")?;
+        for _ in 0..3 {
+            send_recv_echo(packet.clone(), &send_tx, &mut recv_rx).await?;
+        }
+        for _ in 0..2 {
+            inbox_tx
+                .send(ActiveRelayMessage::EntrySamples(vec![
+                    (relay.clone(), Duration::from_millis(20)),
+                    (entry.clone(), Duration::from_millis(200)),
+                ]))
+                .await
+                .std_context("send direct measurements")?;
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while updates.get().as_ref().map(|s| s.access_url()) != Some(&relay) {
+                updates.updated().await.expect("watch remains open");
+            }
+        })
+        .await
+        .std_context("direct entrance was selected")?;
+        for _ in 0..3 {
+            send_recv_echo(packet.clone(), &send_tx, &mut recv_rx).await?;
+        }
         Ok(())
     }
 

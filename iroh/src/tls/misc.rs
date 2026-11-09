@@ -101,6 +101,11 @@ impl Blake3HmacKey {
         rng.fill_bytes(&mut key);
         Self(key)
     }
+
+    /// ember: the same at every bind with the same secret key (`Builder::stable_reset_key`), and telling nothing of it.
+    pub(crate) fn derived(secret_key: &iroh_base::SecretKey) -> Self {
+        Self(blake3::derive_key("iroh-ember stateless reset key v1", &secret_key.to_bytes()))
+    }
 }
 
 impl crypto::HmacKey for Blake3HmacKey {
@@ -121,5 +126,29 @@ impl crypto::HmacKey for Blake3HmacKey {
         } else {
             Err(crypto::CryptoError)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use noq_proto::crypto::HmacKey;
+
+    use super::*;
+
+    /// ember: an endpoint bound again with the same secret key makes the resets its peers were told to expect.
+    #[test]
+    fn derived_reset_key_is_the_same_for_the_same_secret_key() {
+        let mut rng = rand::rng();
+        let secret = iroh_base::SecretKey::generate();
+        let again = iroh_base::SecretKey::from_bytes(&secret.to_bytes());
+        let other = iroh_base::SecretKey::generate();
+        let sign = |key: &Blake3HmacKey| {
+            let mut out = [0u8; 32];
+            key.sign(b"a connection id", &mut out);
+            out
+        };
+        assert_eq!(sign(&Blake3HmacKey::derived(&secret)), sign(&Blake3HmacKey::derived(&again)));
+        assert_ne!(sign(&Blake3HmacKey::derived(&secret)), sign(&Blake3HmacKey::derived(&other)));
+        assert_ne!(sign(&Blake3HmacKey::derived(&secret)), sign(&Blake3HmacKey::new(&mut rng)));
     }
 }

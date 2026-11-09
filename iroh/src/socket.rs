@@ -182,6 +182,9 @@ pub(crate) struct Options {
     /// ember: whether relays are asked for their UDP way.
     pub(crate) relay_udp: bool,
 
+    /// ember: whether the stateless reset key is derived from `secret_key` (`Builder::stable_reset_key`).
+    pub(crate) stable_reset_key: bool,
+
     /// TLS configuration for HTTPS and non-iroh-QUIC connections.
     pub(crate) tls_config: rustls::ClientConfig,
 
@@ -903,6 +906,7 @@ impl EndpointInner {
             dns_resolver,
             proxy_url,
             relay_udp,
+            stable_reset_key,
             server_config,
             tls_config,
             metrics,
@@ -1042,8 +1046,12 @@ impl EndpointInner {
             span: span.clone(),
         });
 
-        let mut endpoint_config =
-            noq::EndpointConfig::new(Arc::new(Blake3HmacKey::new(&mut rand::rng())));
+        let reset_key = if stable_reset_key {
+            Blake3HmacKey::derived(&secret_key)
+        } else {
+            Blake3HmacKey::new(&mut rand::rng())
+        };
+        let mut endpoint_config = noq::EndpointConfig::new(Arc::new(reset_key));
         // Setting this to false means that noq will ignore packets that have the QUIC fixed bit
         // set to 0. The fixed bit is the 3rd bit of the first byte of a packet.
         // For performance reasons and to not rewrite buffers we pass non-QUIC UDP packets straight
@@ -2243,6 +2251,7 @@ mod tests {
             secret_key,
             proxy_url: None,
             relay_udp: false,
+            stable_reset_key: false,
             dns_resolver: DnsResolver::new(),
             server_config,
             tls_config: CaTlsConfig::default()
@@ -2663,6 +2672,7 @@ mod tests {
             dns_resolver,
             proxy_url: None,
             relay_udp: false,
+            stable_reset_key: false,
             server_config,
             tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())

@@ -139,6 +139,8 @@ pub struct Builder {
     proxy_url: Option<Url>,
     /// ember: [`Builder::relay_udp`].
     relay_udp: bool,
+    /// ember: [`Builder::stable_reset_key`].
+    stable_reset_key: bool,
     ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
     dns_resolver: Option<DnsResolver>,
@@ -208,6 +210,7 @@ impl Builder {
             addr_filter: None,
             proxy_url: None,
             relay_udp: false,
+            stable_reset_key: false,
             ca_tls_config: None,
             #[cfg(not(wasm_browser))]
             dns_resolver: None,
@@ -273,6 +276,7 @@ impl Builder {
             address_lookup_user_data: self.address_lookup_user_data,
             proxy_url: self.proxy_url,
             relay_udp: self.relay_udp,
+            stable_reset_key: self.stable_reset_key,
             #[cfg(not(wasm_browser))]
             dns_resolver,
             server_config,
@@ -724,6 +728,17 @@ impl Builder {
     /// relays them by the WebSocket as before. Off by default; not in browsers.
     pub fn relay_udp(mut self, relay_udp: bool) -> Self {
         self.relay_udp = relay_udp;
+        self
+    }
+
+    /// ember: the key QUIC's stateless resets are made with derived from the secret key, not drawn anew at each bind:
+    /// an endpoint started again with the same secret key (a process restarted, killed with its connections open)
+    /// answers a packet of a connection it no longer has with a reset its peer takes, which closes that connection at
+    /// once, where one made with another key is ignored and the peer waits out its idle timeout. Only for an endpoint
+    /// whose key one process holds at a time: two live at once with one key would reset each other's connections
+    /// whenever a packet of one's reached the other. Off by default.
+    pub fn stable_reset_key(mut self, stable: bool) -> Self {
+        self.stable_reset_key = stable;
         self
     }
 

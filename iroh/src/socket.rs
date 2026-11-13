@@ -130,11 +130,10 @@ pub(crate) const RELAY_PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30)
 
 /// Maximum number of concurrent QUIC multipath paths per connection.
 ///
-/// We expect 1 relay path, and then leave space for ~3 IP and custom transport paths.
-/// On top of that, when we expect a network change, we might be closing these paths
-/// (except for the relay path) and open new ones, and give us 3 more paths to spare.
-/// And finally we round that up to 8 for good measure.
-pub(crate) const MAX_MULTIPATH_PATHS: u32 = 8;
+/// ember: 24 (upstream: 8, for 1 relay path): an endpoint home on every relay (`Builder::home_on_every_relay`) opens a
+/// path through each (up to 8 relays in still.fail), beside custom transport tries (`CUSTOM_PATH_LOST_MAX`), unopened
+/// relay tries (`RELAY_CONN_LOST_MAX`) and direct IP / NAT traversal paths.
+pub(crate) const MAX_MULTIPATH_PATHS: u32 = 24;
 
 /// Maximum number of n0 QUIC NAT Traversal addresses that the QUIC stack should allow.
 ///

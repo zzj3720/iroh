@@ -88,6 +88,13 @@ const CUSTOM_PATH_RECHECK: Duration = Duration::from_secs(1);
 /// closed), and then no path of any kind could open. 4 leaves the first path, a relay, a direct path and one more.
 const CUSTOM_PATH_LOST_MAX: u32 = 4;
 
+/// ember: how many path ids a connection may lose to each relay whose path is given up before it opens
+/// (`RemoteStateActor::reopen_relay_paths`), and across all relays on the connection, before it stops trying that relay
+/// until a path through it opens or the network changes (major). A relay that does not answer never sees the path on
+/// the remote, so each failed validation keeps its path id for good, just as for custom paths (`CUSTOM_PATH_LOST_MAX`).
+const RELAY_PATH_LOST_MAX: u32 = 2;
+const RELAY_CONN_LOST_MAX: u32 = 6;
+
 /// ember: how often the path is chosen again from its connections' paths' RTTs. Chosen only as a path opened, was
 /// established or was given up, a connection stayed on a relay whose path had gone seconds slow (its queue to a phone
 /// growing) while another relay's answered in a few hundred milliseconds (2026-10-30, minutes long).
@@ -505,6 +512,9 @@ impl RemoteStateActor {
                 custom_lost: 0,
                 custom_event_try: false,
                 custom_not_before: None,
+                relay_opening: Default::default(),
+                relay_lost: Default::default(),
+                relay_lost_total: 0,
             })
             .into_mut();
 
@@ -659,13 +669,19 @@ impl RemoteStateActor {
         }
 
         if is_major {
-            // ember: on another network a custom transport that never answered may now (Salix reached again): one more
-            // try on each connection, within the ids it may lose (`CUSTOM_PATH_LOST_MAX`); the timer's tries and waits
-            // stay as they were.
+            // ember: on another network a custom transport or relay that never answered may now (Salix or a relay
+            // reached again): one more try on each connection, within the ids it may lose (`CUSTOM_PATH_LOST_MAX`,
+            // `RELAY_CONN_LOST_MAX`); the timer's tries and waits stay as they were.
             for conn_state in self.connections.values_mut() {
                 conn_state.custom_event_try = true;
+                if conn_state.relay_lost_total < RELAY_CONN_LOST_MAX {
+                    conn_state.relay_lost.clear();
+                }
             }
             self.open_custom_paths();
+            if self.state.several_relays {
+                self.reopen_relay_paths();
+            }
             self.trigger_holepunching();
         }
     }
@@ -797,12 +813,17 @@ impl RemoteStateActor {
                 // ember: a custom path that opens: a later one missing is tried for soon again.
                 conn_state.custom_opening.retain(|id| *id != path_id);
                 conn_state.path_state.record_custom_opening(conn_state.custom_opening.len());
-                if opened.is_some_and(|open| matches!(open.remote(), transports::Addr::Custom(_))) {
-                    conn_state.custom_not_before = None;
-                    conn_state.custom_tries = 0;
-                    conn_state.path_state.record_custom_tries(0);
-                    conn_state.custom_lost = 0;
-                    conn_state.path_state.record_custom_lost(0);
+                conn_state.relay_opening.remove(&path_id);
+                if let Some(ref open) = opened {
+                    if matches!(open.remote(), transports::Addr::Custom(_)) {
+                        conn_state.custom_not_before = None;
+                        conn_state.custom_tries = 0;
+                        conn_state.path_state.record_custom_tries(0);
+                        conn_state.custom_lost = 0;
+                        conn_state.path_state.record_custom_lost(0);
+                    } else if open.is_relay() {
+                        conn_state.relay_lost.remove(&open.remote());
+                    }
                 }
                 self.select_path();
             }
@@ -814,6 +835,19 @@ impl RemoteStateActor {
                 }
                 conn_state.custom_opening.retain(|opening| *opening != id);
                 conn_state.path_state.record_custom_opening(conn_state.custom_opening.len());
+                // ember: a relay path given up before it opened: its id is lost for good (`RELAY_PATH_LOST_MAX`,
+                // `RELAY_CONN_LOST_MAX`).
+                if let Some(relay_addr) = conn_state.relay_opening.remove(&id) {
+                    let lost = conn_state.relay_lost.entry(relay_addr).or_default();
+                    *lost += 1;
+                    conn_state.relay_lost_total += 1;
+                    if self.state.several_relays
+                        && *lost < RELAY_PATH_LOST_MAX
+                        && conn_state.relay_lost_total < RELAY_CONN_LOST_MAX
+                    {
+                        self.state.relay_reopen_at = Some(Instant::now() + RELAY_REOPEN);
+                    }
+                }
                 // Remove abandoned path from the conn state.
                 let Some(network_path) = conn_state.remove_path(&id, &conn) else {
                     debug!(%id, "path not in path_id_map");
@@ -841,6 +875,12 @@ impl RemoteStateActor {
                     ?reason
                 );
 
+                let no_ip_left = conn.side().is_client()
+                    && !conn_state
+                        .paths
+                        .iter()
+                        .any(|(pid, a)| a.is_ip() && conn.path(*pid).is_some());
+
                 // If the remote closed our selected path, select a new one.
                 self.select_path();
                 // ember: a relay's path, tried again a moment later (`reopen_relay_paths`).
@@ -851,6 +891,11 @@ impl RemoteStateActor {
                 // that never opened is not in the connection's paths (it returned above): the retry timer reopens it.
                 if matches!(network_path.remote(), transports::Addr::Custom(_)) {
                     self.open_custom_paths();
+                }
+                // ember: the connection's last direct path was given up: holepunch again so it does not wait out
+                // `UPGRADE_INTERVAL` (60 s) on a relay.
+                if network_path.is_ip() && no_ip_left {
+                    self.trigger_holepunching();
                 }
             }
             NoqPathEvent::Discarded { id, path_stats, .. } => {
@@ -915,7 +960,7 @@ impl RemoteStateActor {
             return;
         };
 
-        for (conn_id, conn_state) in self.connections.iter() {
+        for (conn_id, conn_state) in self.connections.iter_mut() {
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
@@ -923,6 +968,24 @@ impl RemoteStateActor {
             // Open path if it doesn't exist yet.
             self.state
                 .open_path_on_conn(*conn_id, conn_state, &conn, &selected);
+
+            // ember: which live IP path on this connection to keep open (`conn_state.paths` still holds paths
+            // `path.close()` just abandoned until their `NoqPathEvent::Abandoned` is polled, and `selected` may be a
+            // relay or custom path, in which case `conn_state.paths.values().filter(|a| a.is_ip()).count() > 1` inside
+            // the loop closed every IP path on the connection).
+            let keep_ip = conn_state
+                .paths
+                .iter()
+                .filter(|(path_id, addr)| addr.is_ip() && conn.path(**path_id).is_some())
+                .min_by_key(|(path_id, addr)| {
+                    let is_selected = *addr == &selected;
+                    let rtt = conn
+                        .path_stats(**path_id)
+                        .and_then(|s| s.same_path_rtt.or(Some(s.rtt)))
+                        .unwrap_or(Duration::MAX);
+                    (!is_selected, rtt, **path_id)
+                })
+                .map(|(path_id, _)| *path_id);
 
             for (path_id, path_remote) in conn_state.paths.iter() {
                 let Some(path) = conn.path(*path_id) else {
@@ -936,8 +999,7 @@ impl RemoteStateActor {
                 // and racing to abandon the last one.
                 if conn.side().is_client()
                     && path_remote.is_ip()
-                    && path_remote != &selected
-                    && conn_state.paths.values().filter(|a| a.is_ip()).count() > 1
+                    && Some(*path_id) != keep_ip
                 {
                     trace!(?path_remote, %conn_id, %path_id, "closing direct path");
                     match path.close() {
@@ -965,7 +1027,8 @@ impl RemoteStateActor {
     }
 
     /// ember: a path through each relay the remote is on, on every connection that has none through it (its relay
-    /// gone a while, back now perhaps): tried again after RELAY_REOPEN while one is missing.
+    /// gone a while, back now perhaps): tried again after RELAY_REOPEN while one is missing, within the path ids the
+    /// connection may lose to relays that do not answer (`RELAY_PATH_LOST_MAX`, `RELAY_CONN_LOST_MAX`).
     fn reopen_relay_paths(&mut self) {
         let relays: Vec<_> = self
             .state
@@ -974,20 +1037,42 @@ impl RemoteStateActor {
             .filter(|addr| addr.is_relay())
             .map(|addr| transports::FourTuple::from_remote(addr.clone()))
             .collect();
-        for addr in &relays {
-            self.open_path_on_all_conns(addr);
+        let mut missing = false;
+        for (conn_id, conn_state) in self.connections.iter_mut() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            if !conn.side().is_client() {
+                continue;
+            }
+            for addr in &relays {
+                let remote = addr.remote();
+                if conn_state.paths.values().any(|p| p == addr) {
+                    continue;
+                }
+                if conn_state.relay_lost.get(&remote).copied().unwrap_or(0) >= RELAY_PATH_LOST_MAX {
+                    continue;
+                }
+                if conn_state.relay_opening.values().any(|a| a == &remote) {
+                    missing = true;
+                    continue;
+                }
+                if conn_state.relay_lost_total + conn_state.relay_opening.len() as u32
+                    >= RELAY_CONN_LOST_MAX
+                {
+                    break;
+                }
+                missing = true;
+                self.state.open_path_on_conn(*conn_id, conn_state, &conn, addr);
+            }
         }
-        let missing = self.connections.values().any(|c| {
-            c.handle.upgrade().is_some_and(|conn| conn.side().is_client())
-                && relays.iter().any(|r| !c.paths.values().any(|p| p == r))
-        });
         if missing {
             self.state.relay_reopen_at = Some(Instant::now() + RELAY_REOPEN);
         }
     }
 
     fn open_path_on_all_conns(&mut self, open_addr: &transports::FourTuple) {
-        for (conn_id, conn_state) in self.connections.iter() {
+        for (conn_id, conn_state) in self.connections.iter_mut() {
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
@@ -1316,7 +1401,7 @@ impl State {
     fn open_path_on_conn(
         &mut self,
         conn_id: ConnId,
-        conn_state: &ConnectionState,
+        conn_state: &mut ConnectionState,
         conn: &noq::Connection,
         open_addr: &transports::FourTuple,
     ) -> Option<PathId> {
@@ -1329,6 +1414,19 @@ impl State {
         if conn_state.paths.values().any(|a| a == open_addr) {
             return None;
         }
+        if open_addr.is_relay()
+            && self.several_relays
+            && (conn_state
+                .relay_lost
+                .get(&open_addr.remote())
+                .copied()
+                .unwrap_or(0)
+                >= RELAY_PATH_LOST_MAX
+                || conn_state.relay_lost_total + conn_state.relay_opening.len() as u32
+                    >= RELAY_CONN_LOST_MAX)
+        {
+            return None;
+        }
 
         let quic_addr =
             open_addr.to_noq_four_tuple(&self.relay_mapped_addrs, &self.custom_mapped_addrs);
@@ -1338,6 +1436,9 @@ impl State {
         match fut.path_id() {
             Some(path_id) => {
                 trace!(%conn_id, %path_id, ?path_status, "opening new path");
+                if open_addr.is_relay() {
+                    conn_state.relay_opening.insert(path_id, open_addr.remote());
+                }
                 return Some(path_id);
             }
             None => {
@@ -1684,6 +1785,14 @@ struct ConnectionState {
     custom_event_try: bool,
     /// ember: when the next try may start ([`CUSTOM_PATH_RETRY_AFTER`]).
     custom_not_before: Option<Instant>,
+    /// ember: the relay paths being opened (not yet established or abandoned), with the remote relay address of each.
+    relay_opening: FxHashMap<PathId, transports::Addr>,
+    /// ember: the path ids lost per relay address to paths given up before they opened ([`RELAY_PATH_LOST_MAX`] at
+    /// most), since a path through that relay last opened on this connection or a major network change.
+    relay_lost: FxHashMap<transports::Addr, u32>,
+    /// ember: the total path ids this connection lost to relay paths given up before they opened
+    /// ([`RELAY_CONN_LOST_MAX`] at most).
+    relay_lost_total: u32,
 }
 
 impl ConnectionState {

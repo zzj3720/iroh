@@ -836,6 +836,119 @@ mod tests {
         Ok(())
     }
 
+    /// ember: when a connection has two IP paths open while a non-IP path is selected (a relay or custom transport),
+    /// `apply_selected_path` closes only one redundant IP path and keeps the other live IP path open, so the
+    /// connection can still fall back to IP at once if the selected path goes dead.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_one_ip_path_kept_when_non_ip_selected_and_two_ip_paths_open() -> Result<()> {
+        let network = TestNetwork::new();
+        let (ep1, ep2, router, s2) = custom_later_endpoints(&network).await?;
+        let conn = ep1.connect(mixed_addr(&ep2, s2.public()), ECHO_ALPN).await?;
+        settle(&conn, is_custom_selected).await;
+        until(10, "expected an IP path beside the custom path", || {
+            conn.paths().iter().any(|p| p.remote_addr().is_ip())
+        })
+        .await;
+        let ip = conn
+            .paths()
+            .iter()
+            .find_map(|p| match p.remote_addr() {
+                TransportAddr::Ip(addr) => Some(*addr),
+                _ => None,
+            })
+            .expect("an IP path");
+        assert!(conn.open_another_path(ip).await, "opening a second IP path failed");
+        until(10, "redundant IP path was not pruned to one", || {
+            conn.paths().iter().filter(|p| p.remote_addr().is_ip()).count() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            conn.paths().iter().filter(|p| p.remote_addr().is_ip()).count(),
+            1,
+            "all IP paths were closed when a non-IP path was selected: {:?}",
+            conn.paths()
+        );
+
+        network.black_hole(s2.public());
+        until(10, "did not fall back to IP path", || {
+            selected(&conn).is_some_and(|a| a.is_ip())
+        })
+        .await;
+        verify_echo(&conn, b"kept ip path").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// ember: with `home_on_every_relay`, an unreachable relay in the peer's address is tried at most
+    /// `RELAY_PATH_LOST_MAX` times instead of burning path ids every `RELAY_REOPEN` forever, so the connection keeps
+    /// its direct IP path and still has path ids free for new paths.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_home_on_every_relay_bounds_dead_relay_tries_and_keeps_path_ids() -> Result<()> {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        relay_b.shutdown().await.anyerr()?;
+
+        let bind = |secret: SecretKey| {
+            let relays = relays.clone();
+            async move {
+                Endpoint::builder(presets::N0)
+                    .secret_key(secret)
+                    .alpns(vec![ECHO_ALPN.to_vec()])
+                    .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(500))
+                            .default_path_max_idle_timeout(Duration::from_secs(2))
+                            .build(),
+                    )
+                    .bind()
+                    .await
+            }
+        };
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+        let ep1 = bind(s1).await?;
+        let ep2 = bind(s2.clone()).await?;
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let ip_addrs: Vec<_> = ep2.addr().ip_addrs().copied().map(TransportAddr::Ip).collect();
+        let addr = EndpointAddr::from_parts(
+            s2.public(),
+            ip_addrs
+                .into_iter()
+                .chain([TransportAddr::Relay(url_a), TransportAddr::Relay(url_b)]),
+        );
+        let conn = ep1.connect(addr, ECHO_ALPN).await?;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let ip = conn
+            .paths()
+            .iter()
+            .find_map(|p| match p.remote_addr() {
+                TransportAddr::Ip(addr) => Some(*addr),
+                _ => None,
+            })
+            .expect("direct IP path should remain open");
+        assert!(
+            conn.open_another_path(ip).await,
+            "unreachable relay exhausted path ids: {:?}",
+            conn.paths()
+        );
+        verify_echo(&conn, b"still direct").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
     /// Test that IP is selected over custom transport when custom has an RTT disadvantage.
     #[tokio::test]
     #[traced_test]

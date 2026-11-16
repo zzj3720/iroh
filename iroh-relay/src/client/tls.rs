@@ -291,6 +291,14 @@ async fn dial_happy_eyeballs(
                         .inspect_err(|err| debug!("failed to connect: {err:#}"))?;
                     trace!("TCP stream connected");
                     stream.set_nodelay(true)?;
+                    // ember: little unsent data held in the kernel (as the relay server holds, `NOTSENT_LOWAT`), so
+                    // what waits to be sent waits in the relay actor's queue, where it is dropped once stale
+                    // (`MAX_SEND_DATAGRAM_WAIT`), not hundreds of KB of it behind a slow uplink. Linux and Android
+                    // only: a macOS `VirtualMac` guest has its own bound (`tcp.rs`), other Macs keep ordinary batching.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if let Err(err) = socket2::SockRef::from(&stream).set_tcp_notsent_lowat(64 * 1024) {
+                        debug!("TCP_NOTSENT_LOWAT not set: {err}");
+                    }
                     Ok(stream)
                 }
                 .instrument(info_span!("connect", %addr)),

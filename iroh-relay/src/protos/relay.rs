@@ -36,8 +36,13 @@ pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The number of packets buffered for sending per client
+///
+/// ember: room for what many endpoints send one client at once (still.fail: 17 stations answering one device, each
+/// connection's initial window 256 KiB, some 213 packets); 512 dropped some 18 % of them. Packets do not wait in it
+/// long: the server drops one that waited longer than its `MAX_PACKET_WAIT`, and the socket holds little unsent data
+/// (`NOTSENT_LOWAT`).
 #[cfg(feature = "server")]
-pub const PER_CLIENT_SEND_QUEUE_DEPTH: usize = 512;
+pub const PER_CLIENT_SEND_QUEUE_DEPTH: usize = 4096;
 
 /// Protocol send errors.
 #[stack_error(derive, add_meta, from_sources)]

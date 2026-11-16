@@ -929,6 +929,7 @@ impl Inner {
 
         // Create a server builder with default config
         let websocket = tokio_websockets::ServerBuilder::new()
+            .config(super::streams::websocket_config())
             .limits(tokio_websockets::Limits::default().max_payload_len(Some(MAX_FRAME_SIZE)))
             // Serve will create a WebSocketStream on an already upgraded connection
             .serve(io);

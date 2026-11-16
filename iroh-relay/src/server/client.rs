@@ -55,6 +55,9 @@ pub(super) struct Packet {
 /// way still.fail's relays carry.
 const MAX_PACKET_WAIT: Duration = Duration::from_millis(200);
 
+/// ember: the most packets taken from a client's queue and written to it with one flush.
+const SEND_PACKETS_BATCH_SIZE: usize = 64;
+
 /// Configuration for a client connection.
 ///
 /// Generic over the stream type to support different WebSocket implementations.
@@ -398,11 +401,19 @@ where
         ping_interval.tick().await;
 
         let mut rate_limit_notified = false;
+        // ember: the packets taken from the queue at once, written out with one flush.
+        let mut send_packets_buf = Vec::with_capacity(SEND_PACKETS_BATCH_SIZE);
 
         loop {
+            // ember: checked first, as `biased;` did, now that the select below is not.
+            if done.is_cancelled() {
+                trace!("actor loop cancelled, exiting");
+                // final flush
+                self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
+                break;
+            }
+            // ember: not `biased;`: a client that keeps sending must not starve what is to be sent to it.
             tokio::select! {
-                biased;
-
                 _ = done.cancelled() => {
                     trace!("actor loop cancelled, exiting");
                     // final flush
@@ -427,19 +438,44 @@ where
                     // reset the ping interval, we just received a message
                     ping_interval.reset();
                 }
-                // Second priority, sending regular packets
-                packet = self.packet_send_queue.recv() => {
-                    let packet = packet.ok_or_else(|| e!(RunError::HandleDropped))?;
-                    if packet.queued.elapsed() > MAX_PACKET_WAIT {
-                        trace!("packet waited too long, dropping");
-                        self.metrics.send_packets_dropped.inc();
-                        continue;
+                count = self.packet_send_queue.recv_many(&mut send_packets_buf, SEND_PACKETS_BATCH_SIZE) => {
+                    if count == 0 {
+                        return Err(e!(RunError::HandleDropped));
                     }
-                    self.send_packet(packet)
-                        .await
-                        .map_err(|err| e!(RunError::PacketSend, err))?;
+                    let mut fed = false;
+                    for packet in send_packets_buf.drain(..) {
+                        if packet.queued.elapsed() > MAX_PACKET_WAIT {
+                            trace!("packet waited too long, dropping");
+                            self.metrics.send_packets_dropped.inc();
+                            continue;
+                        }
+                        if let Some(udp) = &mut self.udp {
+                            udp.send(&packet.src, &packet.data, &self.metrics);
+                            continue;
+                        }
+                        let len = packet.data.contents.len();
+                        let frame = RelayToClientMsg::Datagrams {
+                            remote_endpoint_id: packet.src,
+                            datagrams: packet.data,
+                        };
+                        // Fed, not flushed: the batch is flushed once below.
+                        if let Err(err) = self.feed_frame(frame).await {
+                            self.metrics.send_packets_dropped.inc();
+                            return Err(e!(RunError::PacketSend, err));
+                        }
+                        fed = true;
+                        if let Ok(len) = len.try_into() {
+                            self.metrics.bytes_sent.inc_by(len);
+                        }
+                        self.metrics.send_packets_sent.inc();
+                    }
+                    if fed {
+                        self.flush_frames()
+                            .await
+                            .map_err(|err| e!(RunError::PacketSend, err))?;
+                    }
+                    continue;
                 }
-                // Last priority, sending other message
                 message = self.message_send_queue.recv() => {
                     let message = message.ok_or_else(|| e!(RunError::HandleDropped))?;
                     trace!("send {message:?}");
@@ -478,40 +514,21 @@ where
         Ok(())
     }
 
-    /// Writes contents to the client in a `RECV_PACKET` frame.
+    /// ember: writes the frame to the connection's buffer, not flushed (but once the buffer is over its
+    /// `flush_threshold`).
     ///
-    /// Errors if the send does not happen within the `timeout` duration
-    /// Does not flush.
-    async fn send_raw(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
-        let remote_endpoint_id = packet.src;
-        let datagrams = packet.data;
-
-        if let Ok(len) = datagrams.contents.len().try_into() {
-            self.metrics.bytes_sent.inc_by(len);
-        }
-        self.write_frame(RelayToClientMsg::Datagrams {
-            remote_endpoint_id,
-            datagrams,
-        })
-        .await
+    /// Errors if this does not happen within the `timeout` duration.
+    async fn feed_frame(&mut self, frame: RelayToClientMsg) -> Result<(), WriteFrameError> {
+        tokio::time::timeout(self.timeout, self.stream.feed(frame)).await??;
+        Ok(())
     }
 
-    async fn send_packet(&mut self, packet: Packet) -> Result<(), WriteFrameError> {
-        trace!("send packet");
-        if let Some(udp) = &mut self.udp {
-            udp.send(&packet.src, &packet.data, &self.metrics);
-            return Ok(());
-        }
-        match self.send_raw(packet).await {
-            Ok(()) => {
-                self.metrics.send_packets_sent.inc();
-                Ok(())
-            }
-            Err(err) => {
-                self.metrics.send_packets_dropped.inc();
-                Err(err)
-            }
-        }
+    /// ember: flushes what was fed to the connection.
+    ///
+    /// Errors if this does not happen within the `timeout` duration.
+    async fn flush_frames(&mut self) -> Result<(), WriteFrameError> {
+        tokio::time::timeout(self.timeout, self.stream.flush()).await??;
+        Ok(())
     }
 
     /// Handles frame read results.
@@ -867,6 +884,99 @@ mod tests {
             longest <= Duration::from_secs(1),
             "a packet waited {longest:?}"
         );
+
+        clients.shutdown().await;
+        Ok(())
+    }
+
+    /// ember: a burst of packets for one client, more than upstream's queue held (512) as many endpoints answering one
+    /// client at once send it, all reach the client, in order, written out in batches.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_burst_for_one_client_all_forwarded() -> Result {
+        const SENT: u32 = 2000;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(11u64);
+        let client_key = SecretKey::from_bytes(&rng.random()).public();
+        let station = SecretKey::from_bytes(&rng.random()).public();
+
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let config = Config::new(
+            OnDisconnectGuard::empty(client_key),
+            ServerRelayedStream::test(server),
+            ProtocolVersion::V2,
+        );
+        let mut conn = Conn::test(client, ProtocolVersion::V2);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        clients.register(config, metrics.clone());
+
+        // All queued before the client's actor runs.
+        let refused = (0..SENT)
+            .filter(|i| {
+                clients
+                    .send_packet(
+                        client_key,
+                        Datagrams::from(&i.to_be_bytes()),
+                        station,
+                        &metrics,
+                    )
+                    .is_err()
+            })
+            .count();
+        assert_eq!(refused, 0, "packets refused by a full queue");
+
+        for i in 0..SENT {
+            let frame = tokio::time::timeout(
+                Duration::from_secs(10),
+                recv_frame(FrameType::RelayToClientDatagram, &mut conn),
+            )
+            .await
+            .std_context("a packet")??;
+            assert_eq!(
+                frame,
+                RelayToClientMsg::Datagrams {
+                    remote_endpoint_id: station,
+                    datagrams: Datagrams::from(&i.to_be_bytes()),
+                }
+            );
+        }
+        assert_eq!(metrics.send_packets_sent.get(), SENT as u64);
+        assert_eq!(metrics.send_packets_dropped.get(), 0);
+
+        clients.shutdown().await;
+        Ok(())
+    }
+
+    /// ember: a packet dropped because the client's queue is full is counted in `send_packets_dropped`, as every other
+    /// packet the relay drops is. Upstream did not count it.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_full_queue_drops_are_counted() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(12u64);
+        let client_key = SecretKey::from_bytes(&rng.random()).public();
+        let station = SecretKey::from_bytes(&rng.random()).public();
+
+        // A queue of 10.
+        let (config, _conn) = test_client_builder(client_key, ProtocolVersion::V2);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        clients.register(config, metrics.clone());
+
+        // All sent before the client's actor runs: the queue takes 10, the rest find it full.
+        let refused = (0..100u32)
+            .filter(|i| {
+                clients
+                    .send_packet(
+                        client_key,
+                        Datagrams::from(&i.to_be_bytes()),
+                        station,
+                        &metrics,
+                    )
+                    .is_err()
+            })
+            .count() as u64;
+        assert_eq!(refused, 90);
+        assert_eq!(metrics.send_packets_dropped.get(), refused);
 
         clients.shutdown().await;
         Ok(())

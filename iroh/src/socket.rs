@@ -91,6 +91,7 @@ mod metrics;
 pub(crate) mod biased_rtt_path_selector;
 pub(crate) mod concurrent_read_map;
 pub(crate) mod mapped_addrs;
+pub(crate) mod relay_policy;
 pub(crate) mod remote_map;
 pub(crate) mod transports;
 
@@ -348,6 +349,8 @@ impl ShutdownState {
 /// possible.
 #[derive(Debug)]
 pub(crate) struct Socket {
+    /// ember: the relays each remote is not to be reached through (`Endpoint::set_disabled_relays`).
+    relay_policies: relay_policy::RelayPolicies,
     /// Read-only view of the per-remote `RemoteStateActor` inboxes.
     ///
     /// Lets callers send to an existing `RemoteStateActor` without going through
@@ -968,13 +971,16 @@ impl EndpointInner {
         let shutdown_state = ShutdownState::default();
         let shutdown_token = shutdown_state.at_endpoint_closed.child_token();
 
-        let transports = Transports::bind(
+        let mut transports = Transports::bind(
             &transport_configs,
             relay_actor_config,
             &metrics,
             shutdown_token.child_token(),
         )
         .map_err(|err| e!(BindError::Sockets, err))?;
+        // ember: the relays each remote is not to be reached through (`Endpoint::set_disabled_relays`).
+        let relay_policies = relay_policy::RelayPolicies::default();
+        transports.set_relay_policies(relay_policies.clone());
 
         if let Some(v4_port) = transports.local_addrs().into_iter().find_map(|t| {
             if let transports::Addr::Ip(SocketAddr::V4(addr)) = t {
@@ -1014,6 +1020,7 @@ impl EndpointInner {
                 path_selector,
                 span.clone(),
                 relay_maps.len() > 1,
+                relay_policies.clone(),
             )
         };
 
@@ -1021,6 +1028,7 @@ impl EndpointInner {
 
         let sock = Arc::new(Socket {
             remote_actors: remote_map.senders(),
+            relay_policies,
             shutdown: shutdown_state,
             ipv6_reported,
             mapped_addrs: remote_map.mapped_addrs.clone(),
@@ -1408,6 +1416,11 @@ impl EndpointInner {
     {
         let (tx, rx) = oneshot::channel();
         let remote_id = addr.id;
+        // ember: in force where datagrams are handed on before anything of this dial is sent (its actor gives up what
+        // it had through them as it takes the message).
+        if let Some(disabled) = &disabled {
+            self.relay_policies.set(remote_id, disabled.clone());
+        }
         self.actor_sender
             .send(ActorMessage::ResolveRemote(addr, disabled, tx))
             .await
@@ -1417,6 +1430,24 @@ impl EndpointInner {
             Ok(()) => Ok(Ok(self.mapped_addrs.endpoint_addrs.get(&remote_id))),
             Err(err) => Ok(Err(err)),
         }
+    }
+
+    /// ember: the relays `remote` is not to be reached through (none: any), in force once this resolves: what is sent
+    /// it through one from then on is dropped (`TransportsSender::poll_send`), and its actor has given up every
+    /// address, path and path being opened through one (`RemoteStateActor::apply_relay_policy`). What was handed to a
+    /// relay transport before is not called back.
+    pub(crate) async fn set_disabled_relays(&self, remote: EndpointId, disabled: BTreeSet<RelayUrl>) {
+        self.relay_policies.set(remote, disabled);
+        let (tx, rx) = oneshot::channel();
+        if self.actor_sender.send(ActorMessage::RelayPolicy(remote, tx)).await.is_ok() {
+            rx.await.ok();
+        }
+    }
+
+    /// ember: what was handed to a relay transport for `remote` through `relay`, and dropped, disabled (tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn relay_datagrams(&self, relay: &RelayUrl, remote: &EndpointId) -> relay_policy::RelayDatagrams {
+        self.relay_policies.datagrams(relay, remote)
     }
 
     /// Fetches the [`RemoteInfo`] about a remote from the `RemoteStateActor`.
@@ -1486,6 +1517,9 @@ enum ActorMessage {
     /// ember: a relay inserted into the endpoint, told every relay transport.
     #[debug("RelayInserted({_0})")]
     RelayInserted(RelayUrl, Arc<RelayConfig>),
+    /// ember: a remote's disabled relays changed: its actor goes by them, then the sender is told.
+    #[debug("RelayPolicy(..)")]
+    RelayPolicy(EndpointId, oneshot::Sender<()>),
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
@@ -1894,6 +1928,9 @@ impl Actor {
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
                 self.remote_map.add_connection(remote, conn, tx).await;
+            }
+            ActorMessage::RelayPolicy(remote, tx) => {
+                self.remote_map.apply_relay_policy(remote, tx).await;
             }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]

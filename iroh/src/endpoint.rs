@@ -3932,7 +3932,9 @@ mod tests {
             .bind()
             .await?;
 
+        let first_closed = std::sync::Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn({
+            let first_closed = first_closed.clone();
             let server = server.clone();
             async move {
                 for i in 0..2 {
@@ -3946,6 +3948,7 @@ mod tests {
                     send.write_all(&data).await.anyerr()?;
                     send.finish().anyerr()?;
                     conn.closed().await;
+                    if i == 0 { first_closed.notify_one(); }
                 }
                 Ok::<_, Error>(())
             }
@@ -3968,6 +3971,10 @@ mod tests {
         conn.close(0u32.into(), b"bye!");
 
         assert_eq!(&data, b"Hello, world!");
+
+        // Deliver the first close before removing the transport that carries it.
+        // Otherwise the server waits for its idle timeout before accepting round two.
+        first_closed.notified().await;
 
         // setup a second relay server
         let (new_relay_map, new_relay_url, _guard2) = run_relay_server().await?;

@@ -1735,6 +1735,34 @@ impl Endpoint {
         self.inner.remote_info(endpoint_id).await
     }
 
+    /// ember: the relays `remote` is not to be reached through; none, any (as with no call). As
+    /// [`ConnectOptions::with_disabled_relays`] says them, with no dial: what a connection to `remote` has already is
+    /// held to them too.
+    ///
+    /// Once this resolves, nothing is sent `remote` through one of them: a datagram for it through one is dropped where
+    /// datagrams are handed to the relay transports (a connection's packets on a path it has, the Initials of a dial
+    /// raced on every address known), and the addresses, paths and paths being opened through one are given up on
+    /// every connection to it (where one is a connection's last path, a path through each relay not disabled is opened
+    /// and it is closed once another is established: its sends are dropped meanwhile). Its IP and custom addresses
+    /// and paths are kept. A dial after it takes no path through them, whatever addresses it is given or address lookup
+    /// finds. What was handed to a relay transport before is not called back.
+    ///
+    /// They are kept until set again (an actor for `remote` started anew goes by them): the caller bounds how many
+    /// remotes have some.
+    pub async fn set_disabled_relays(&self, remote: EndpointId, disabled: BTreeSet<RelayUrl>) {
+        if self.is_closed() {
+            return;
+        }
+        self.inner.set_disabled_relays(remote, disabled).await
+    }
+
+    /// ember: what was handed to a relay transport for `remote` through `relay`, and what was dropped instead, the
+    /// relay disabled for it (`set_disabled_relays`).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn relay_datagrams(&self, relay: &RelayUrl, remote: &EndpointId) -> crate::RelayDatagrams {
+        self.inner.relay_datagrams(relay, remote)
+    }
+
     // # Methods for less common state updates.
 
     /// Notifies the system of potential network changes.
@@ -3357,6 +3385,320 @@ mod tests {
         Ok(())
     }
 
+    /// ember: a remote's relay disabled (`Endpoint::set_disabled_relays`) on a connection with the direct path chosen and
+    /// a backup path through each of two relays: once it resolves nothing is handed to that relay for that remote
+    /// (datagrams dropped for it are counted apart), the path through it is given up, and the connection goes on, its
+    /// direct path kept. A dial after it, given both relays, takes the other alone. Enabled again, the relay is used again.
+    #[tokio::test]
+    #[traced_test]
+    async fn remote_relays_narrowed_send_nothing_through_the_one_left_out() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .build(),
+                    )
+                    .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .expect("an address")
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(11).await?;
+        let client = bind(10).await?;
+        let addr = time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server.addr();
+                let urls: Vec<_> = addr.relay_urls().cloned().collect();
+                if urls.contains(&url_a) && urls.contains(&url_b) && addr.ip_addrs().next().is_some() {
+                    return addr;
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        let echo = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = echo.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let got = recv.read_to_end(64).await.unwrap_or_default();
+                        send.write_all(&got).await.ok();
+                        send.finish().ok();
+                    }
+                });
+            }
+        });
+        let echoes = async |conn: &Connection| -> Result {
+            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+            send.write_all(b"still there").await.anyerr()?;
+            send.finish().anyerr()?;
+            assert_eq!(recv.read_to_end(64).await.anyerr()?, b"still there");
+            Ok(())
+        };
+        let through = |conn: &Connection, url: &RelayUrl| conn.paths().iter().any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()));
+        let until = async |what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+            time::timeout(Duration::from_secs(20), async {
+                while !cond() {
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| n0_error::anyerr!("{what}: not in time"))
+        };
+        let remote = server.id();
+        let conn = client.connect(addr.clone(), TEST_ALPN).await?;
+        echoes(&conn).await?;
+        // The direct path chosen, a path through each relay beside it (a backup).
+        until("a path through each relay beside the direct one chosen", Box::new(|| {
+            through(&conn, &url_a)
+                && through(&conn, &url_b)
+                && conn.paths().iter().any(|p| p.is_ip() && p.is_selected())
+                && !conn.paths().iter().any(|p| p.is_relay() && p.is_selected())
+        }))
+        .await?;
+
+        client.set_disabled_relays(remote, [url_a.clone()].into()).await;
+        let a = client.relay_datagrams(&url_a, &remote);
+        let b = client.relay_datagrams(&url_b, &remote);
+        info!(?a, ?b, "narrowed to b");
+        until("the path through a given up", Box::new(|| !through(&conn, &url_a))).await?;
+        // Rounds of keeping the paths alive (every 200 ms), counted on b.
+        until("b kept alive some rounds", Box::new(|| client.relay_datagrams(&url_b, &remote).sent >= b.sent + 10)).await?;
+        echoes(&conn).await?;
+        assert_eq!(client.relay_datagrams(&url_a, &remote).sent, a.sent, "handed to a after it was left out");
+        // (kept: which way is chosen among those left is the selector's, by their round trips)
+        assert!(conn.paths().iter().any(|p| p.is_ip()), "the direct path is kept");
+        assert!(conn.close_reason().is_none(), "the connection goes on");
+
+        // A dial given both relays is made by b alone.
+        let b = client.relay_datagrams(&url_b, &remote);
+        let again = client.connect(addr.clone(), TEST_ALPN).await?;
+        echoes(&again).await?;
+        until("the new connection's path through b, kept alive some rounds", Box::new(|| through(&again, &url_b) && client.relay_datagrams(&url_b, &remote).sent >= b.sent + 10)).await?;
+        assert!(!through(&again, &url_a), "a path through a on a connection dialed after");
+        assert_eq!(client.relay_datagrams(&url_a, &remote).sent, a.sent, "handed to a after it was left out");
+        info!(after = ?client.relay_datagrams(&url_a, &remote), "a");
+
+        // Taken away: a dial given both relays goes through a again.
+        client.set_disabled_relays(remote, Default::default()).await;
+        let third = client.connect(addr, TEST_ALPN).await?;
+        echoes(&third).await?;
+        until("a path through a again", Box::new(|| through(&third, &url_a))).await?;
+        assert!(client.relay_datagrams(&url_a, &remote).sent > a.sent);
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: the relay a connection's packets go through disabled for its remote (relays alone, no IP): the
+    /// connection moves to the other relay at once and goes on, nothing handed to the one disabled once it resolves.
+    #[tokio::test]
+    #[traced_test]
+    async fn remote_relays_narrowed_off_the_chosen_relay_move_to_another() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .build(),
+                    )
+                    .clear_ip_transports()
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(21).await?;
+        let client = bind(20).await?;
+        let addr = time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server.addr();
+                let urls: Vec<_> = addr.relay_urls().cloned().collect();
+                if urls.contains(&url_a) && urls.contains(&url_b) {
+                    return addr;
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        let echo = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = echo.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let got = recv.read_to_end(64).await.unwrap_or_default();
+                        send.write_all(&got).await.ok();
+                        send.finish().ok();
+                    }
+                });
+            }
+        });
+        let echoes = async |conn: &Connection| -> Result {
+            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+            send.write_all(b"still there").await.anyerr()?;
+            send.finish().anyerr()?;
+            assert_eq!(recv.read_to_end(64).await.anyerr()?, b"still there");
+            Ok(())
+        };
+        let through = |conn: &Connection, url: &RelayUrl| conn.paths().iter().any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()));
+        let until = async |what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+            time::timeout(Duration::from_secs(20), async {
+                while !cond() {
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| n0_error::anyerr!("{what}: not in time"))
+        };
+        let remote = server.id();
+        let conn = client.connect(addr, TEST_ALPN).await?;
+        echoes(&conn).await?;
+        until("a path through each relay, one chosen", Box::new(|| through(&conn, &url_a) && through(&conn, &url_b) && conn.paths().iter().any(|p| p.is_selected()))).await?;
+        let chosen = conn.paths().iter().find(|p| p.is_selected()).map(|p| p.remote_addr().clone()).expect("chosen");
+        let (out, kept) = if chosen == TransportAddr::Relay(url_a.clone()) { (url_a.clone(), url_b.clone()) } else { (url_b.clone(), url_a.clone()) };
+        info!(%out, %kept, "leaving out the relay chosen");
+
+        client.set_disabled_relays(remote, [out.clone()].into()).await;
+        let left = client.relay_datagrams(&out, &remote);
+        let other = client.relay_datagrams(&kept, &remote);
+        until("moved to the relay kept", Box::new(|| !through(&conn, &out) && conn.paths().iter().any(|p| p.is_selected() && p.remote_addr() == &TransportAddr::Relay(kept.clone())))).await?;
+        echoes(&conn).await?;
+        until("the relay kept used some rounds", Box::new(|| client.relay_datagrams(&kept, &remote).sent >= other.sent + 10)).await?;
+        echoes(&conn).await?;
+        assert_eq!(client.relay_datagrams(&out, &remote).sent, left.sent, "handed to the relay left out after it was");
+        assert!(conn.close_reason().is_none(), "the connection goes on");
+        info!(left = ?client.relay_datagrams(&out, &remote), kept = ?client.relay_datagrams(&kept, &remote), "counts");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: a connection kept (the direct path chosen, a backup path through each of two relays) while its remote's
+    /// relay `a` is disabled by a later dial (`with_disabled_relays`, as a dial made after a workspace turned it off
+    /// says it): the kept connection's path through `a` is given up too, nothing more is handed to `a` for the remote,
+    /// and relay `a` passes nothing on in a window after one that lets what was on its way pass (the server answers only
+    /// on paths the client opened). Before `with_disabled_relays` held what a connection had, `a` passed 14 then 4 on.
+    #[tokio::test]
+    #[traced_test]
+    async fn disabled_relays_hold_a_connection_kept() -> Result {
+        let (map_a, url_a, relay_a) = run_relay_server().await?;
+        let (map_b, url_b, relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .build(),
+                    )
+                    .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .expect("an address")
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(31).await?;
+        let client = bind(30).await?;
+        let _accepting = accepting(&server);
+        let addr = time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server.addr();
+                let urls: Vec<_> = addr.relay_urls().cloned().collect();
+                if urls.contains(&url_a) && urls.contains(&url_b) && addr.ip_addrs().next().is_some() {
+                    return addr;
+                }
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        let remote = server.id();
+        let through = |conn: &Connection, url: &RelayUrl| conn.paths().iter().any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()));
+        let sent = |r: &iroh_relay::server::Server| r.metrics().server.send_packets_recv.get();
+        let conn = client.connect(addr.clone(), TEST_ALPN).await?;
+        time::timeout(Duration::from_secs(20), async {
+            while !(through(&conn, &url_a)
+                && through(&conn, &url_b)
+                && conn.paths().iter().any(|p| p.is_ip() && p.is_selected())
+                && !conn.paths().iter().any(|p| p.is_relay() && p.is_selected()))
+            {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        let again = client
+            .connect_with_opts(addr, TEST_ALPN, ConnectOptions::new().with_disabled_relays([url_a.clone()]))
+            .await?
+            .await
+            .anyerr()?;
+        let handed = client.relay_datagrams(&url_a, &remote);
+        let (a_from, b_from) = (sent(&relay_a), sent(&relay_b));
+        assert!(!through(&conn, &url_a), "the kept connection's path through a given up as the dial took hold");
+        let past = async |n: u64| {
+            time::timeout(Duration::from_secs(30), async {
+                while sent(&relay_b) < b_from + n {
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .anyerr()
+        };
+        past(10).await?;
+        let a_settled = sent(&relay_a);
+        past(30).await?;
+        let a_after = sent(&relay_a);
+        info!(first_window = a_settled - a_from, second_window = a_after - a_settled, handed_after = ?client.relay_datagrams(&url_a, &remote), "relay a after it was disabled");
+        assert_eq!(client.relay_datagrams(&url_a, &remote).sent, handed.sent, "handed to a for the remote after it was disabled");
+        assert_eq!(a_after, a_settled, "relay a passed datagrams on in the second window, a disabled");
+        assert!(!through(&again, &url_a), "the connection dialed with a disabled has a path through it");
+        assert!(conn.paths().iter().any(|p| p.is_ip()) && conn.close_reason().is_none(), "the kept connection goes on, its direct path kept");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn endpoint_two_relay_only_no_ip() -> Result {
@@ -3590,7 +3932,9 @@ mod tests {
             .bind()
             .await?;
 
+        let first_closed = std::sync::Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn({
+            let first_closed = first_closed.clone();
             let server = server.clone();
             async move {
                 for i in 0..2 {
@@ -3604,6 +3948,7 @@ mod tests {
                     send.write_all(&data).await.anyerr()?;
                     send.finish().anyerr()?;
                     conn.closed().await;
+                    if i == 0 { first_closed.notify_one(); }
                 }
                 Ok::<_, Error>(())
             }
@@ -3626,6 +3971,10 @@ mod tests {
         conn.close(0u32.into(), b"bye!");
 
         assert_eq!(&data, b"Hello, world!");
+
+        // Deliver the first close before removing the transport that carries it.
+        // Otherwise the server waits for its idle timeout before accepting round two.
+        first_closed.notified().await;
 
         // setup a second relay server
         let (new_relay_map, new_relay_url, _guard2) = run_relay_server().await?;

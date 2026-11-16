@@ -75,7 +75,15 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// This means while this batch is sending to the server no other relay protocol frames can
 /// be sent to the server, e.g. no Ping frames or so.  While the maximum packet size is
 /// rather large, each item can typically be expected to up to 1500 or the max GSO size.
-const SEND_DATAGRAM_BATCH_SIZE: usize = 20;
+const SEND_DATAGRAM_BATCH_SIZE: usize = 64;
+
+/// ember: the longest a datagram waits to be sent to the relay server before it is dropped instead.
+///
+/// The relay server drops what waits longer than its `MAX_PACKET_WAIT` for a slow client; this is the same on the
+/// client's side. Queued behind a slow uplink or a relay connection being dialed again, a datagram sent seconds late is
+/// no use to QUIC and makes its round trip seconds long (2.5–3.9 s seen, still.fail's devices on one self-hosted relay).
+/// Dropped, the sender's congestion control slows to what the link takes.
+const MAX_SEND_DATAGRAM_WAIT: Duration = Duration::from_millis(500);
 
 /// Timeout for establishing the relay connection.
 ///
@@ -899,6 +907,20 @@ impl ActiveRelayActor {
                         break Ok(None);
                     };
                     self.reset_inactive_timeout();
+                    // ember: what waited too long is dropped, not sent late (`MAX_SEND_DATAGRAM_WAIT`).
+                    let now = Instant::now();
+                    send_datagrams_buf.retain(|item| {
+                        let stale = item
+                            .queued
+                            .is_some_and(|queued| now.duration_since(queued) > MAX_SEND_DATAGRAM_WAIT);
+                        if stale {
+                            trace!(?MAX_SEND_DATAGRAM_WAIT, "datagram waited too long, dropping");
+                        }
+                        !stale
+                    });
+                    if send_datagrams_buf.is_empty() {
+                        continue;
+                    }
                     // TODO(frando): can we avoid the clone here?
                     let metrics = self.metrics.clone();
                     let packet_iter = send_datagrams_buf.drain(..).map(|item| {
@@ -1155,6 +1177,8 @@ pub(crate) struct RelaySendItem {
     pub(crate) url: RelayUrl,
     /// One or more datagrams to send.
     pub(crate) datagrams: Datagrams,
+    /// ember: when it was queued to be sent, if it is to be dropped after waiting `MAX_SEND_DATAGRAM_WAIT`.
+    pub(crate) queued: Option<Instant>,
 }
 
 pub(super) struct RelayActor {
@@ -1363,10 +1387,6 @@ impl RelayActor {
         mut receiver: mpsc::Receiver<RelayActorMessage>,
         mut datagram_send_channel: mpsc::Receiver<RelaySendItem>,
     ) {
-        // When this future is present, it is sending pending datagrams to an
-        // ActiveRelayActor.  We can not process further datagrams during this time.
-        let mut datagram_send_fut = std::pin::pin!(MaybeFuture::None);
-
         // ember: home on its one relay at once, not after net_report's first report.
         if let Some(url) = self.only_relay() {
             self.config
@@ -1403,22 +1423,13 @@ impl RelayActor {
                     let cancel_token = self.cancel_token.child_token();
                     cancel_token.run_until_cancelled(self.handle_msg(msg)).await;
                 }
-                // Only poll for new datagrams if we are not blocked on sending them.
-                item = datagram_send_channel.recv(), if datagram_send_fut.is_none() => {
+                item = datagram_send_channel.recv() => {
                     let Some(item) = item else {
                         debug!("Datagram send channel dropped, shutting down.");
                         break;
                     };
                     let token = self.cancel_token.child_token();
-                    if let Some(Some(fut)) = token.run_until_cancelled(
-                        self.try_send_datagram(item)
-                    ).await {
-                        datagram_send_fut.as_mut().set_future(fut);
-                    }
-                }
-                // Only poll this future if it is in use.
-                _ = &mut datagram_send_fut, if datagram_send_fut.is_some() => {
-                    datagram_send_fut.as_mut().set_none();
+                    token.run_until_cancelled(self.try_send_datagram(item)).await;
                 }
             }
         }
@@ -1532,33 +1543,23 @@ impl RelayActor {
         }
     }
 
-    /// Sends datagrams to the correct [`ActiveRelayActor`], or returns a future.
+    /// Sends datagrams to the correct [`ActiveRelayActor`].
     ///
-    /// If the datagram can not be sent immediately, because the destination channel is
-    /// full, a future is returned that will complete once the datagrams have been sent to
-    /// the [`ActiveRelayActor`].
-    async fn try_send_datagram(
-        &mut self,
-        item: RelaySendItem,
-    ) -> Option<impl Future<Output = ()> + use<>> {
+    /// ember: if that actor's queue is full the datagrams are dropped, as a socket drops what it has no room for.
+    /// Upstream waited for room, and while it waited no datagram went to any other relay: one relay being dialed (or
+    /// not answering) held every relay of this transport up to `UNDELIVERABLE_DATAGRAM_TIMEOUT`, 3 s, at a time.
+    async fn try_send_datagram(&mut self, item: RelaySendItem) {
         let url = item.url.clone();
         let handle = self
             .active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint)
             .await;
         match handle.datagrams_send_queue.try_send(item) {
-            Ok(()) => None,
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!(?url, "Dropped datagram(s): ActiveRelayActor closed.");
-                None
             }
-            Err(mpsc::error::TrySendError::Full(item)) => {
-                let sender = handle.datagrams_send_queue.clone();
-                let fut = async move {
-                    if sender.send(item).await.is_err() {
-                        warn!(?url, "Dropped datagram(s): ActiveRelayActor closed.");
-                    }
-                };
-                Some(fut)
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!(?url, "Dropped datagram(s): ActiveRelayActor's queue is full.");
             }
         }
     }
@@ -1723,8 +1724,8 @@ impl RelayActor {
             udp: self.config.relay_udp.clone(),
         };
 
-        // TODO: Replace 64 with PER_CLIENT_SEND_QUEUE_DEPTH once that's unused
-        let (send_datagram_tx, send_datagram_rx) = mpsc::channel(64);
+        // ember: as many as the transport's queue holds, all of them maybe for this relay.
+        let (send_datagram_tx, send_datagram_rx) = mpsc::channel(super::RELAY_DATAGRAM_QUEUE);
         let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
@@ -1887,9 +1888,11 @@ mod tests {
 
     use super::{
         ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
-        HomeRelayWatch, RELAY_INACTIVE_CLEANUP_TIME, RelayConnectionOptions, RelayConnectionState,
-        RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
+        Config, HomeRelayWatch, MAX_SEND_DATAGRAM_WAIT, RELAY_INACTIVE_CLEANUP_TIME, RelayActor,
+        RelayConnectionOptions, RelayConnectionState, RelayRecvDatagram, RelaySendItem,
+        UNDELIVERABLE_DATAGRAM_TIMEOUT,
     };
+    use crate::socket::transports::relay::RELAY_DATAGRAM_QUEUE;
     use crate::{dns::DnsResolver, test_utils};
 
     /// Starts a new [`ActiveRelayActor`].
@@ -1994,6 +1997,7 @@ mod tests {
                             remote_endpoint: src,
                             url: relay_url.clone(),
                             datagrams,
+                            queued: None,
                         };
                         send_datagram_tx.send(send).await.ok();
                     }
@@ -2166,6 +2170,7 @@ mod tests {
             remote_endpoint: peer,
             url: relay.clone(),
             datagrams: Datagrams::from(b"still connected"),
+            queued: None,
         };
         send_recv_echo(packet.clone(), &send_tx, &mut recv_rx).await?;
         let mut updates = watch.watch();
@@ -2237,6 +2242,7 @@ mod tests {
             remote_endpoint: peer_endpoint,
             url: relay_url.clone(),
             datagrams: Datagrams::from(b"hello"),
+            queued: None,
         };
         send_recv_echo(
             hello_send_item.clone(),
@@ -2465,6 +2471,175 @@ mod tests {
                 .is_ok(),
             "actor task still running"
         );
+
+        cancel_token.cancel();
+        Ok(())
+    }
+
+    /// ember: a relay that does not answer (here one that takes the TCP connection and never its handshake: dialed
+    /// for seconds) holds no datagram for another relay of the same transport. Upstream the transport's actor waited
+    /// for room in the unanswering relay's queue, and while it waited sent nothing to any relay, until that queue was
+    /// emptied as undeliverable (`UNDELIVERABLE_DATAGRAM_TIMEOUT`, 3 s): one unreachable self-hosted relay held the
+    /// devices' connections to every station through a healthy one for seconds. The bound is that timeout: an echo
+    /// through the local relay takes milliseconds, and upstream could not answer before it.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_unreachable_relay_does_not_hold_up_another() -> Result {
+        let (relay_map, relay_url, _server) = test_utils::run_relay_server().await?;
+        let (peer, _echo) = start_echo_endpoint(relay_url.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .std_context("bind unanswering relay")?;
+        let unanswering: RelayUrl = format!(
+            "https://{}",
+            listener.local_addr().std_context("unanswering relay address")?
+        )
+        .parse()
+        .std_context("unanswering relay URL")?;
+        let _unanswering = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        }));
+
+        let config = Config {
+            my_relay: HomeRelayWatch::default(),
+            secret_key: SecretKey::generate(),
+            dns_resolver: DnsResolver::new(),
+            proxy_url: None,
+            relay_udp: Default::default(),
+            ipv6_reported: Arc::new(AtomicBool::new(false)),
+            tls_config: CaTlsConfig::insecure_skip_verify()
+                .client_config(default_provider())
+                .expect("infallible"),
+            metrics: Default::default(),
+            relay_map,
+            excludes: Default::default(),
+            own: None,
+            others: Vec::new(),
+        };
+        let (recv_tx, mut recv_rx) = mpsc::channel(RELAY_DATAGRAM_QUEUE);
+        // Room for all this test sends: it never waits on the actor.
+        let (send_tx, send_rx) = mpsc::channel(2 * RELAY_DATAGRAM_QUEUE);
+        let (_msg_tx, msg_rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let actor = RelayActor::new(config, recv_tx, cancel.clone());
+        let _actor = AbortOnDropHandle::new(tokio::spawn(
+            actor.run(msg_rx, send_rx).instrument(info_span!("relay-actor")),
+        ));
+
+        let packet = RelaySendItem {
+            remote_endpoint: peer,
+            url: relay_url.clone(),
+            datagrams: Datagrams::from(b"through the healthy relay"),
+            queued: None,
+        };
+        // Connected to the healthy relay, its echo answering.
+        send_recv_echo(packet.clone(), &send_tx, &mut recv_rx).await?;
+        while tokio::time::timeout(Duration::from_millis(100), recv_rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        // More than any relay's queue holds for the unanswering relay, then one for the healthy relay.
+        let nobody = SecretKey::generate().public();
+        let start = tokio::time::Instant::now();
+        for i in 0..RELAY_DATAGRAM_QUEUE + 200 {
+            send_tx
+                .try_send(RelaySendItem {
+                    remote_endpoint: nobody,
+                    url: unanswering.clone(),
+                    datagrams: Datagrams::from(&(i as u64).to_le_bytes()),
+                    queued: None,
+                })
+                .expect("room in the transport's queue");
+        }
+        send_tx
+            .try_send(packet.clone())
+            .expect("room in the transport's queue");
+        let echoed = tokio::time::timeout(UNDELIVERABLE_DATAGRAM_TIMEOUT, recv_rx.recv()).await;
+        let took = start.elapsed();
+        info!(?took, "echo through the healthy relay");
+        let echoed = echoed.unwrap_or_else(|_| {
+            panic!("the healthy relay's datagram was held behind the unanswering relay's ({took:?})")
+        });
+        assert_eq!(echoed.expect("receive queue open").datagrams, packet.datagrams);
+
+        cancel.cancel();
+        Ok(())
+    }
+
+    /// ember: a datagram that waited longer than `MAX_SEND_DATAGRAM_WAIT` to be sent is dropped, not sent late; one
+    /// that did not is sent. Upstream sent both: behind a slow uplink or a relay connection dialed again, datagrams
+    /// seconds old reached the peer and made the connection's round trip seconds long.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_stale_send_datagrams_are_dropped() -> Result {
+        let (_relay_map, relay_url, _server) = test_utils::run_relay_server().await?;
+        let (peer, _echo) = start_echo_endpoint(relay_url.clone());
+
+        let (datagram_recv_tx, mut datagram_recv_rx) = mpsc::channel(16);
+        let (send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
+        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
+        let (_inbox_tx, inbox_rx) = mpsc::channel(16);
+        let cancel_token = CancellationToken::new();
+        let _task = start_active_relay_actor(
+            SecretKey::from_bytes(&[5u8; 32]),
+            cancel_token.clone(),
+            relay_url.clone(),
+            prio_inbox_rx,
+            inbox_rx,
+            send_datagram_rx,
+            datagram_recv_tx,
+            info_span!("actor-under-test"),
+        );
+        let item = |data: &'static [u8], queued| RelaySendItem {
+            remote_endpoint: peer,
+            url: relay_url.clone(),
+            datagrams: Datagrams::from(data),
+            queued,
+        };
+
+        // Connected, the echo answering; no echo left over.
+        send_recv_echo(item(b"connected", None), &send_datagram_tx, &mut datagram_recv_rx).await?;
+        while tokio::time::timeout(Duration::from_millis(100), datagram_recv_rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        let now = n0_future::time::Instant::now();
+        let stale = now
+            .checked_sub(MAX_SEND_DATAGRAM_WAIT * 2)
+            .expect("an instant a second ago");
+        send_datagram_tx
+            .send(item(b"stale", Some(stale)))
+            .await
+            .std_context("send stale")?;
+        send_datagram_tx
+            .send(item(b"fresh", Some(now)))
+            .await
+            .std_context("send fresh")?;
+        let first = tokio::time::timeout(Duration::from_secs(10), datagram_recv_rx.recv())
+            .await
+            .std_context("an echo")?
+            .expect("receive queue open");
+        assert_eq!(
+            first.datagrams,
+            Datagrams::from(b"fresh"),
+            "the stale datagram was sent"
+        );
+        // Nor sent later: the next echo is of what is sent next.
+        send_datagram_tx
+            .send(item(b"after", Some(n0_future::time::Instant::now())))
+            .await
+            .std_context("send after")?;
+        let next = tokio::time::timeout(Duration::from_secs(10), datagram_recv_rx.recv())
+            .await
+            .std_context("an echo")?
+            .expect("receive queue open");
+        assert_eq!(next.datagrams, Datagrams::from(b"after"));
 
         cancel_token.cancel();
         Ok(())

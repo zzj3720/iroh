@@ -24,6 +24,14 @@ mod actor;
 pub(crate) use self::actor::{Config as RelayActorConfig, Excludes, HomeRelayWatch, RelayConnectionState};
 use self::actor::{RelayActor, RelayActorMessage, RelayRecvDatagram, RelaySendItem};
 
+/// ember: how many datagrams a relay transport queues each way, between its connections and its relay actor. A send
+/// that finds the queue full is dropped (`Sender::poll_send` does not wait on one transport), so it must hold what
+/// all connections sharing the transport send at once: still.fail's devices reach 17 stations over one self-hosted
+/// relay, each connection with a 256 KiB initial window (some 213 datagrams), and 256 + 64 slots lost 15–20 % of
+/// their packets. Stale datagrams do not pile up in it: the relay actor drops those that waited longer than
+/// `MAX_SEND_DATAGRAM_WAIT`.
+pub(crate) const RELAY_DATAGRAM_QUEUE: usize = 4096;
+
 type RelayAddrWatcher =
     n0_watcher::Map<n0_watcher::Direct<Option<RelayStatus>>, Option<(RelayUrl, EndpointId)>>;
 
@@ -52,9 +60,10 @@ impl std::fmt::Display for RelayTransport {
 
 impl RelayTransport {
     pub(crate) fn new(config: RelayActorConfig, cancel_token: CancellationToken) -> Self {
-        let (relay_datagram_send_tx, relay_datagram_send_rx) = mpsc::channel(256);
+        // ember: room for a burst of every connection sharing this transport (`RELAY_DATAGRAM_QUEUE`).
+        let (relay_datagram_send_tx, relay_datagram_send_rx) = mpsc::channel(RELAY_DATAGRAM_QUEUE);
 
-        let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(512);
+        let (relay_datagram_recv_tx, relay_datagram_recv_rx) = mpsc::channel(RELAY_DATAGRAM_QUEUE);
 
         let (actor_sender, actor_receiver) = mpsc::channel(256);
 
@@ -321,6 +330,28 @@ impl RelaySender {
         dest_endpoint: EndpointId,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
+        // ember: taken at once while the queue has room. `poll_reserve` waits for a permit as any Tokio resource does,
+        // so past the task's cooperative budget (128 operations a poll) it is pending however empty the queue is, and a
+        // pending send is dropped (`Sender::poll_send`): a connection sending its whole window in one poll lost the
+        // datagrams after its first 128 (`test_relay_sender_sends_a_window_in_one_poll`). Only a full queue waits.
+        if let Some(sender) = self.sender.get_ref() {
+            let item = RelaySendItem {
+                remote_endpoint: dest_endpoint,
+                url: dest_url.clone(),
+                datagrams: datagrams_from_transmit(transmit),
+                queued: Some(n0_future::time::Instant::now()),
+            };
+            match sender.try_send(item) {
+                Ok(()) => return Poll::Ready(Ok(())),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "channel to actor is closed",
+                    )));
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+            }
+        }
         match ready!(self.sender.poll_reserve(cx)) {
             Ok(()) => {
                 let contents = datagrams_from_transmit(transmit);
@@ -328,6 +359,7 @@ impl RelaySender {
                     remote_endpoint: dest_endpoint,
                     url: dest_url.clone(),
                     datagrams: contents,
+                    queued: Some(n0_future::time::Instant::now()),
                 };
                 match self.sender.send_item(item) {
                     Ok(()) => Poll::Ready(Ok(())),
@@ -371,6 +403,41 @@ mod tests {
 
     use super::*;
     use crate::defaults::staging;
+
+    /// ember: a connection's whole window sent in one poll is queued while the queue has room. Upstream each send
+    /// waited for a permit (`poll_reserve`), pending once the task's cooperative budget was spent, and a pending send
+    /// is dropped: of 512 datagrams sent in one poll, 128 were queued.
+    #[tokio::test]
+    async fn test_relay_sender_sends_a_window_in_one_poll() {
+        const SENT: usize = 512;
+        let (mut sender, mut receiver) = RelaySender::bounded_for_test(SENT);
+        let url = staging::default_na_east_relay().url;
+        let endpoint = EndpointId::from_bytes(&[0u8; 32]).unwrap();
+        let transmit = Transmit {
+            ecn: None,
+            contents: b"a datagram",
+            segment_size: None,
+        };
+        let sent = std::future::poll_fn(|cx| {
+            Poll::Ready(
+                (0..SENT)
+                    .filter(|_| {
+                        matches!(
+                            sender.poll_send(cx, url.clone(), endpoint, &transmit),
+                            Poll::Ready(Ok(()))
+                        )
+                    })
+                    .count(),
+            )
+        })
+        .await;
+        assert_eq!(sent, SENT, "datagrams not queued");
+        let mut queued = 0;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, SENT);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_relay_datagram_queue() {

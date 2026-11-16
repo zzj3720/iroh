@@ -220,6 +220,8 @@ impl Clients {
                     dst = %dst.fmt_short(),
                     "client too busy to receive packet, dropping packet"
                 );
+                // ember: counted as every other packet dropped is.
+                metrics.send_packets_dropped.inc();
                 Err(ForwardPacketError::new(SendError::Full))
             }
             Err(TrySendError::Closed(_)) => {

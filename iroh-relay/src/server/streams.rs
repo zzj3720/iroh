@@ -50,6 +50,16 @@ impl<S> RelayedStream<S> {
 #[allow(dead_code)]
 pub(super) type ServerRelayedStream = RelayedStream<WsBytesFramed<RateLimited<MaybeTlsStream>>>;
 
+/// ember: the server's websocket configuration. Frames fed to a client are written out once 8 KiB are buffered, or
+/// when the client actor flushes after a batch (`Actor::run_inner`), not one TLS record and TCP send per packet.
+///
+/// No more than 8 KiB: what is buffered here has passed `MAX_PACKET_WAIT` already and is written within the client's
+/// write timeout as one. 64 KiB held a slow client's packets seconds past that wait, and a client taking less than
+/// 32 KB/s was disconnected by the 2 s write timeout of one flush (`test_slow_client_packets_wait_briefly`).
+pub(super) fn websocket_config() -> tokio_websockets::Config {
+    tokio_websockets::Config::default().flush_threshold(8 * 1024)
+}
+
 #[cfg(test)]
 impl ServerRelayedStream {
     pub(crate) fn test(stream: tokio::io::DuplexStream) -> Self {
@@ -58,6 +68,7 @@ impl ServerRelayedStream {
         Self {
             inner: WsBytesFramed {
                 io: tokio_websockets::ServerBuilder::new()
+                    .config(websocket_config())
                     .limits(Self::limits())
                     .serve(stream),
             },
@@ -81,6 +92,7 @@ impl ServerRelayedStream {
         let stream = Self {
             inner: WsBytesFramed {
                 io: tokio_websockets::ServerBuilder::new()
+                    .config(websocket_config())
                     .limits(Self::limits())
                     .serve(stream),
             },

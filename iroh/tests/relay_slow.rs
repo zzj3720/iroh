@@ -1,12 +1,13 @@
 //! ember: a connection home on every relay leaves a relay whose path went seconds slow. A test binary of its own (CI:
 //! `cargo test -p iroh --features test-utils --test relay_slow`): its relays held seconds long slowed the lib's tests
-//! with second-long timeouts beside it (`test_paths_watcher`).
+//! with second-long timeouts beside it (`test_paths_watcher`). Also a burst of many connections through one relay,
+//! kept off the lib's tests for the same reason.
 #![cfg(not(wasm_browser))]
 
 use std::{sync::Arc, time::Duration};
 
 use iroh::{
-    Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     endpoint::presets,
     test_utils::run_relay_server_with,
     tls::CaTlsConfig,
@@ -233,5 +234,113 @@ async fn new_connection_races_relays_despite_an_existing_selected_path() -> Resu
     );
     reused.close(0u8.into(), b"done"); clean.close(0u8.into(), b"done"); old.close(0u8.into(), b"done");
     client.close().await; fresh.close().await; server.close().await; task.abort();
+    Ok(())
+}
+
+/// ember: one endpoint's connections to 17 others through one relay (still.fail: a device and its stations, the
+/// workspace's own relay alone), each sending its whole initial window (256 KiB, as still.fail's) at once both ways, lose
+/// no packet. The relay's TCP connections lose nothing, so a packet lost is one dropped on the way: upstream's relay
+/// transport queued 256 + 64 datagrams for all its connections, the relay server 512 for each client, while these
+/// bursts are some 1900 packets each way, and a connection's send past its task's cooperative budget was dropped
+/// (`test_relay_sender_sends_a_window_in_one_poll`); 15–20 % of the packets were lost.
+// Several threads, as the relay server is a process of its own: on one thread the 18 endpoints' work held the relay's
+// queue to the client past its `MAX_PACKET_WAIT` now and then (all of 250 packets lost there, in one run of 12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_connections_through_one_relay_lose_no_packets() -> Result {
+    const PEERS: usize = 17;
+    const BYTES: usize = 128 * 1024;
+    let (map, url, _relay) = run_relay_server_with(false).await?;
+    let bind = || {
+        let mut cubic = noq_proto::congestion::CubicConfig::default();
+        cubic.initial_window(256 * 1024);
+        Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(map.clone()))
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .congestion_controller_factory(Arc::new(cubic))
+                    .build(),
+            )
+            .clear_ip_transports()
+            .bind()
+    };
+    let lost = |conn: &iroh::endpoint::Connection| -> u64 {
+        conn.paths().iter().map(|p| p.stats().lost_packets).sum()
+    };
+    let client = bind().await?;
+    let mut peers = Vec::new();
+    for _ in 0..PEERS {
+        peers.push(bind().await?);
+    }
+    for ep in peers.iter().chain([&client]) {
+        time::timeout(Duration::from_secs(10), ep.online()).await.anyerr()?;
+    }
+
+    // Each peer reads what it is sent, sends as much back, and once its data is acknowledged, says how many of its
+    // packets were lost (the connection kept open until the client is done).
+    let mut answers = Vec::new();
+    for peer in &peers {
+        let peer = peer.clone();
+        answers.push(tokio::spawn(async move {
+            let conn = peer.accept().await.anyerr()?.await.anyerr()?;
+            let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
+            let got = recv.read_to_end(BYTES).await.anyerr()?;
+            send.write_all(&got).await.anyerr()?;
+            send.finish().anyerr()?;
+            let _ = send.stopped().await;
+            Ok::<_, n0_error::AnyError>((lost(&conn), conn))
+        }));
+    }
+    let conns = n0_future::join_all(peers.iter().map(|peer| {
+        client.connect(EndpointAddr::new(peer.id()).with_relay_url(url.clone()), TEST_ALPN)
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .anyerr()?;
+    let sent = vec![7u8; BYTES];
+    time::timeout(
+        Duration::from_secs(60),
+        n0_future::join_all(conns.iter().map(|conn| {
+            let sent = &sent;
+            async move {
+                let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+                send.write_all(sent).await.anyerr()?;
+                send.finish().anyerr()?;
+                let got = recv.read_to_end(BYTES).await.anyerr()?;
+                assert_eq!(got.len(), BYTES);
+                Ok::<_, n0_error::AnyError>(())
+            }
+        })),
+    )
+    .await
+    .anyerr()?
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+
+    let client_lost: Vec<u64> = conns.iter().map(lost).collect();
+    let mut peer_lost = Vec::new();
+    let mut held = Vec::new();
+    for answer in answers {
+        let (lost, conn) = time::timeout(Duration::from_secs(30), answer)
+            .await
+            .anyerr()?
+            .anyerr()??;
+        peer_lost.push(lost);
+        held.push(conn);
+    }
+    println!("EMBER-RESULT packets lost: client {client_lost:?}, peers {peer_lost:?}");
+    assert!(
+        client_lost.iter().chain(&peer_lost).all(|&n| n == 0),
+        "packets lost: client {client_lost:?}, peers {peer_lost:?}"
+    );
+    for conn in conns.iter().chain(&held) {
+        conn.close(0u8.into(), b"");
+    }
+    client.close().await;
+    for peer in peers {
+        peer.close().await;
+    }
     Ok(())
 }

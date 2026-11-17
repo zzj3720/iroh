@@ -995,13 +995,14 @@ impl RemoteStateActor {
     #[instrument(skip_all)]
     fn select_path(&mut self) {
         let current_path = self.state.selected_path.as_ref();
-        let selected_addr = {
+        let selection = {
             let ctx = PathSelectionContext::new(current_path, &self.connections);
-            self.state.path_selector.select(&ctx).selected().cloned()
-        }
+            self.state.path_selector.select(&ctx)
+        };
         // ember: never a path through a relay disabled for the remote (one closed, its abandon not
         // polled yet).
-        .filter(|addr| self.state.relay_allowed(&addr.remote()));
+        let selected_addr = selection.selected().cloned()
+            .filter(|addr| self.state.relay_allowed(&addr.remote()));
 
         if let Some(addr) = selected_addr
             && self.state.selected_path.as_ref() != Some(&addr)
@@ -1021,6 +1022,62 @@ impl RemoteStateActor {
         }
 
         self.apply_selected_path();
+        self.close_withdrawn_paths(&selection);
+    }
+
+    /// Retire withdrawn custom paths only after this connection has a validated replacement.
+    fn close_withdrawn_paths(&mut self, selection: &PathSelection) {
+        let Some(selected) = self.state.selected_path.as_ref() else {
+            return;
+        };
+        // Discovery is shared by remote address. Wait until every connection still
+        // using an address has its own validated replacement, then close together.
+        // Partial retirement would keep the address discoverable and reopen it on
+        // already-retired connections. Usually there is only one connection.
+        // Abandoned events remove state.paths before reselection. If noq retires
+        // a replacement concurrently, before its event is consumed here, close's
+        // LastOpenPath guard still prevents abandoning the last usable path.
+        let requested: BTreeSet<_> = selection.close.iter().map(|path| path.remote()).collect();
+        let ready: BTreeSet<_> = requested.into_iter().filter(|remote| {
+            self.connections.values().all(|state| {
+                let Some(conn) = state.handle.upgrade() else { return true };
+                let uses_remote = state.paths.iter().any(|(id, path)| {
+                    &path.remote() == remote && conn.path(*id).is_some()
+                });
+                !uses_remote || state.paths.iter().any(|(id, path)| {
+                    path == selected && &path.remote() != remote && conn.path(*id).is_some()
+                        && conn.path_stats(*id).is_some_and(|stats| stats.same_path_rtt.is_some())
+                })
+            })
+        }).collect();
+        let mut retired = BTreeSet::new();
+        let mut failed = BTreeSet::new();
+        for state in self.connections.values() {
+            let Some(conn) = state.handle.upgrade() else { continue };
+            for (id, addr) in &state.paths {
+                if !ready.contains(&addr.remote()) { continue; }
+                if !selection.close.contains(addr) {
+                    failed.insert(addr.remote());
+                    continue;
+                }
+                if let Some(path) = conn.path(*id) {
+                    // noq still enforces its last-open-path guard. Its path() lookup
+                    // remains Some during draining, so use close's result, not a
+                    // second path() lookup, to decide whether retirement succeeded.
+                    match path.close() {
+                        Ok(()) | Err(noq_proto::ClosePathError::ClosedPath) => {
+                            retired.insert(addr.remote());
+                        }
+                        Err(error) => {
+                            failed.insert(addr.remote());
+                            trace!(?error, ?addr, "could not close withdrawn custom path");
+                        }
+                    }
+                }
+            }
+        }
+        retired.retain(|addr| !failed.contains(addr));
+        self.state.paths.retain(|addr| !retired.contains(addr));
     }
 
     /// Propagates a change of [`State::selected_path`] to noq.
@@ -2115,6 +2172,17 @@ impl<'a> PathSelectionData<'a> {
         self.network_path
     }
 
+    /// Identity of the connection supplying these statistics, without keeping it alive.
+    /// Pair with PathStats::path_generation to identify a path incarnation.
+    #[cfg(feature = "unstable-custom-transports")]
+    pub fn connection(&self) -> Option<PathSelectionConnection> {
+        match &self.source {
+            StatsSource::Live { conn, .. } => Some(PathSelectionConnection(conn.weak_handle())),
+            #[cfg(test)]
+            StatsSource::Test(_) => None,
+        }
+    }
+
     /// Returns path statistics if available.
     pub fn stats(&self) -> Option<PathStats> {
         match &self.source {
@@ -2124,6 +2192,23 @@ impl<'a> PathSelectionData<'a> {
         }
     }
 }
+
+/// Opaque connection identity for comparing path-statistics sources.
+///
+/// A weak handle does not keep the connection alive. Unlike a bare stable_id,
+/// it retains allocation identity even after that connection is dropped.
+#[derive(Debug, Clone)]
+#[cfg(feature = "unstable-custom-transports")]
+pub struct PathSelectionConnection(noq::WeakConnectionHandle);
+
+#[cfg(feature = "unstable-custom-transports")]
+impl PartialEq for PathSelectionConnection {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.is_same_connection(&other.0)
+    }
+}
+#[cfg(feature = "unstable-custom-transports")]
+impl Eq for PathSelectionConnection {}
 
 /// Trait to configure path selection.
 ///
@@ -2142,19 +2227,23 @@ pub trait PathSelector: Send + Sync + std::fmt::Debug + 'static {
 
 /// The set of paths a [`PathSelector`] has chosen.
 ///
-/// Today this holds at most one path.  Build via [`PathSelection::none`] +
-/// [`PathSelection::set`].
+/// Holds at most one selected path and optional custom-path retirement requests.
+/// Build via [`PathSelection::none`], [`PathSelection::set`] and [`PathSelection::close`].
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
 pub struct PathSelection {
     selection: Option<transports::FourTuple>,
+    close: Vec<transports::FourTuple>,
 }
 
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
 impl PathSelection {
     /// An empty selection.
     pub fn none() -> Self {
-        Self { selection: None }
+        Self {
+            selection: None,
+            close: Vec::new(),
+        }
     }
 
     /// Sets the path as the selected path.
@@ -2170,6 +2259,23 @@ impl PathSelection {
             return;
         }
         self.selection = Some(path.network_path.clone());
+    }
+
+    /// Requests retirement of an explicitly withdrawn custom path.
+    ///
+    /// This does not close IP or relay paths. Each connection closes the requested
+    /// path only when its selected, different path is still open and has a validated
+    /// same-path RTT. All connections sharing that remote address must be ready
+    /// before any is closed, so discovery cannot reopen it on a retired connection.
+    /// Without such a replacement the request is ignored; selectors
+    /// should repeat it while the withdrawal remains in effect. Do not use this for
+    /// a path that merely scores worse or suffers a short latency spike.
+    pub fn close(&mut self, path: &PathSelectionData<'_>) {
+        if matches!(path.network_path(), transports::FourTuple::Custom { .. })
+            && !self.close.contains(path.network_path())
+        {
+            self.close.push(path.network_path().clone());
+        }
     }
 
     /// The selected path: the one data should be sent on. This is not public so
@@ -2239,5 +2345,160 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod selector_close_tests {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct CapturePaths {
+        paths: std::sync::Mutex<Vec<(noq::Connection, PathId, transports::FourTuple)>>,
+        changed: tokio::sync::Notify,
+    }
+    impl PathSelector for CapturePaths {
+        fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection {
+            let mut captured = self.paths.lock().unwrap();
+            captured.clear();
+            let mut selected = PathSelection::none();
+            for path in ctx.paths() {
+                if path.stats().is_some_and(|stats| stats.same_path_rtt.is_some()) {
+                    if path.network_path().is_ip() && selected.selected().is_none() {
+                        selected.set(&path);
+                    }
+                    if let StatsSource::Live { conn, path_id } = &path.source {
+                        captured.push((conn.clone(), *path_id, path.network_path().clone()));
+                    }
+                }
+            }
+            self.changed.notify_one();
+            selected
+        }
+    }
+
+    #[tokio::test]
+    async fn selector_close_waits_for_all_connections_then_forgets_address() {
+        use crate::{Endpoint, endpoint::presets, test_utils::test_transport::{TestNetwork, to_custom_addr}};
+        let network = TestNetwork::new();
+        let capture = Arc::new(CapturePaths::default());
+        let a_key = iroh_base::SecretKey::from_bytes(&[21; 32]);
+        let b_key = iroh_base::SecretKey::from_bytes(&[22; 32]);
+        let a = Endpoint::builder(presets::Minimal)
+            .secret_key(a_key.clone()).alpns(vec![b"retire".to_vec()])
+            .add_custom_transport(network.create_transport(a_key.public()).unwrap())
+            .path_selector(capture.clone()).bind().await.unwrap();
+        let b = Endpoint::builder(presets::Minimal)
+            .secret_key(b_key.clone()).alpns(vec![b"retire".to_vec()])
+            .add_custom_transport(network.create_transport(b_key.public()).unwrap())
+            .path_selector(Arc::new(CapturePaths::default())).bind().await.unwrap();
+        let addr = iroh_base::EndpointAddr::from_parts(b.id(), b.addr().addrs.into_iter()
+            .chain([iroh_base::TransportAddr::Custom(to_custom_addr(b.id()))]));
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = tokio::join!(a.connect(addr.clone(), b"retire"), async {
+                b.accept().await.unwrap().await.unwrap()
+            });
+            clients.push(client.unwrap());
+            servers.push(server);
+        }
+        let paths = time::timeout(Duration::from_secs(10), async {
+            loop {
+                capture.changed.notified().await;
+                let paths = capture.paths.lock().unwrap().clone();
+                let mut ready = FxHashMap::<usize, (bool, bool)>::default();
+                for (conn, _, addr) in &paths {
+                    let entry = ready.entry(conn.stable_id()).or_default();
+                    entry.0 |= addr.is_ip();
+                    entry.1 |= matches!(addr, transports::FourTuple::Custom { .. });
+                }
+                if ready.len() == 2 && ready.values().all(|p| p.0 && p.1) { break paths; }
+            }
+        }).await.expect("both connections have validated IP and custom paths");
+        let local = n0_watcher::Watchable::new(BTreeSet::new());
+        let mut actor = RemoteStateActor::new(b.id(), local.watch(), Default::default(),
+            Default::default(), Arc::default(), AddressLookupServices::default(),
+            Arc::new(CapturePaths::default()), false, RelayPolicies::default());
+        let mut connections = FxHashMap::default();
+        for (conn, _, _) in &paths { connections.insert(conn.stable_id(), conn.clone()); }
+        for conn in connections.values() {
+            let (tx, _) = oneshot::channel();
+            actor.handle_msg_add_connection(conn.clone(), tx);
+        }
+        for state in actor.connections.values_mut() { state.paths.clear(); }
+        let mut selection = PathSelection::none();
+        for (conn, id, addr) in &paths {
+            actor.connections.get_mut(&ConnId(conn.stable_id())).unwrap().paths.insert(*id, addr.clone());
+            if matches!(addr, transports::FourTuple::Custom { .. }) {
+                selection.close(&PathSelectionData::for_test(addr, None));
+                actor.state.paths.insert_open_path(addr.remote(), Source::Connection);
+            }
+        }
+        let selected = paths.iter().find(|(_, _, addr)| addr.is_ip()).unwrap().2.clone();
+        actor.state.selected_path = Some(selected.clone());
+        let second = *actor.connections.keys().nth(1).unwrap();
+        let missing: Vec<_> = actor.connections.get_mut(&second).unwrap().paths.extract_if(|_, addr| *addr == selected).collect();
+        assert!(!missing.is_empty(), "same selected IP path exists on both connections");
+        let mut events: Vec<_> = connections.values().map(|conn| conn.path_events()).collect();
+        actor.close_withdrawn_paths(&selection);
+        // A round trip drives both connection tasks, so an erroneous close would
+        // be observable as Abandoned; path() itself retains draining path objects.
+        for (client, server) in clients.iter().zip(&servers) {
+            client.send_datagram(bytes::Bytes::from_static(b"still-open")).unwrap();
+            let data = server.read_datagram().await.unwrap();
+            server.send_datagram(data).unwrap();
+            assert_eq!(client.read_datagram().await.unwrap().as_ref(), b"still-open");
+        }
+        for events in &mut events {
+            while let Some(Some(event)) = now_or_never(events.next()) {
+                assert!(!matches!(event.unwrap(), NoqPathEvent::Abandoned { .. }),
+                    "no partial retirement without both replacements");
+            }
+        }
+        for (_, _, addr) in &paths {
+            if matches!(addr, transports::FourTuple::Custom { .. }) {
+                assert!(actor.state.paths.addrs().any(|known| known == &addr.remote()));
+            }
+        }
+        actor.connections.get_mut(&second).unwrap().paths.extend(missing);
+        actor.close_withdrawn_paths(&selection);
+        for (conn, id, addr) in &paths {
+            if matches!(addr, transports::FourTuple::Custom { .. }) {
+                // noq keeps the path object while draining; ClosedPath proves the
+                // path is already abandoned even before that object is discarded.
+                if let Some(path) = conn.path(*id) {
+                    assert!(matches!(path.close(), Err(noq_proto::ClosePathError::ClosedPath)),
+                        "withdrawn path must already be closed");
+                }
+                assert!(!actor.state.paths.addrs().any(|known| known == &addr.remote()));
+            }
+        }
+        actor.open_custom_paths();
+        assert!(actor.connections.values().all(|state| state.custom_opening.is_empty()),
+            "forgotten circuit is not automatically reopened");
+        drop(clients); drop(servers);
+        a.close().await; b.close().await;
+    }
+
+    #[test]
+    fn selector_close_only_requests_distinct_custom_paths() {
+        let custom = transports::FourTuple::from_remote(transports::Addr::Custom(
+            CustomAddr::from_parts(7, b"withdrawn"),
+        ));
+        let ip = transports::FourTuple::from_remote(transports::Addr::Ip(
+            "127.0.0.1:1234".parse().unwrap(),
+        ));
+        let relay = transports::FourTuple::from_remote(transports::Addr::Relay(
+            "https://relay.example".parse().unwrap(),
+            iroh_base::SecretKey::from_bytes(&[7; 32]).public(),
+        ));
+        let mut selection = PathSelection::none();
+        assert!(selection.close.is_empty());
+        for addr in [&ip, &relay, &custom, &custom] {
+            selection.close(&PathSelectionData::for_test(addr, None));
+        }
+        assert_eq!(selection.close, vec![custom]);
+        assert!(selection.selected().is_none());
     }
 }

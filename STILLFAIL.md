@@ -22,3 +22,20 @@ Removing the guest guard made a healthy Mac's 384 MiB loopback transfer take 393
 it is deliberately not a general macOS default. No system settings are written, no administrator privilege is used,
 and no hardware identity is sent anywhere. The guest workaround should be reconsidered when the underlying
 virtual-network offload defect can be reliably distinguished from a working path.
+
+`Builder::relay_allowlist` optionally fixes the relay URLs an endpoint may use for its lifetime. The default is
+unrestricted, as before; an empty allowlist leaves IP and custom transports available. A relay learned from a
+peer, address lookup or cached path cannot expand this ceiling, nor can `insert_relay` or forwarding-entrance
+updates. The send boundary and relay-actor connection boundary enforce it; home selection and net-report use
+filtered maps detached from caller mutations. Per-remote disabled sets can further restrict the ceiling.
+Changing the ceiling requires a new endpoint, so a policy-scoped underlay cannot silently widen after binding.
+
+Selectors may request `PathSelection::close` only for explicitly withdrawn custom paths.
+Retirement waits until every connection using that remote address has a different selected,
+open path with a same-path RTT, then closes and forgets the withdrawn address to prevent
+automatic reopening. This is not RTT tuning: IP/relay paths and merely slower alternatives
+are unaffected, and noq retains its last-open-path guard.
+
+Custom selectors can compare `PathSelectionData::connection()` weak identities together
+with noq's path generation, same-path RTT epoch and actual ACK sample sequence. Snapshot
+reads and initial PATH_RESPONSE estimates are not sustained quality evidence.

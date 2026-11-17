@@ -182,6 +182,9 @@ pub(crate) struct Options {
     /// ember: whether relays are asked for their UDP way.
     pub(crate) relay_udp: bool,
 
+    /// ember: immutable relay URL ceiling; none preserves upstream behavior.
+    pub(crate) relay_allowlist: Option<BTreeSet<RelayUrl>>,
+
     /// TLS configuration for HTTPS and non-iroh-QUIC connections.
     pub(crate) tls_config: rustls::ClientConfig,
 
@@ -899,12 +902,13 @@ impl EndpointInner {
 
         let Options {
             secret_key,
-            transports: transport_configs,
+            transports: mut transport_configs,
             address_lookup_user_data,
             #[cfg(not(wasm_browser))]
             dns_resolver,
             proxy_url,
             relay_udp,
+            relay_allowlist,
             server_config,
             tls_config,
             metrics,
@@ -918,6 +922,13 @@ impl EndpointInner {
 
         let address_lookup = address_lookup::AddressLookupServices::default();
         let port_mapper = portmapper::create_client(&portmapper_config);
+
+        let relay_allowlist = relay_policy::RelayAllowlist::new(relay_allowlist);
+        for config in &mut transport_configs {
+            if let TransportConfig::Relay { relay_map, .. } = config {
+                *relay_map = relay_allowlist.relay_map(relay_map);
+            }
+        }
 
         let relay_transport_configs: Vec<_> = transport_configs
             .iter()
@@ -963,6 +974,7 @@ impl EndpointInner {
             tls_config: tls_config.clone(),
             metrics: metrics.socket.clone(),
             relay_map: relay_map.clone(),
+            relay_allowlist: relay_allowlist.clone(),
             excludes: Default::default(),
             own: None,
             others: Vec::new(),
@@ -979,7 +991,7 @@ impl EndpointInner {
         )
         .map_err(|err| e!(BindError::Sockets, err))?;
         // ember: the relays each remote is not to be reached through (`Endpoint::set_disabled_relays`).
-        let relay_policies = relay_policy::RelayPolicies::default();
+        let relay_policies = relay_policy::RelayPolicies::with_allowlist(relay_allowlist);
         transports.set_relay_policies(relay_policies.clone());
 
         if let Some(v4_port) = transports.local_addrs().into_iter().find_map(|t| {
@@ -1280,6 +1292,8 @@ impl EndpointInner {
         relay: RelayUrl,
         endpoint: Arc<RelayConfig>,
     ) -> Option<Arc<RelayConfig>> {
+        if !self.relay_policies.allowlist.allows(&relay) { return None; }
+        let endpoint = self.relay_policies.allowlist.config(endpoint);
         let res = self.relay_map.insert(relay.clone(), endpoint.clone());
         // ember: told every relay transport (`Builder::home_on_every_relay`).
         self.actor_sender
@@ -1357,6 +1371,10 @@ impl EndpointInner {
 
     /// Change the entrances to existing relays, including actors already connected to them.
     pub(crate) async fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
+        let entries: Vec<_> = entries.into_iter()
+            .filter(|(url, _)| self.relay_policies.allowlist.allows(url))
+            .map(|(url, list)| (url, list.into_iter().filter(|entry| self.relay_policies.allowlist.allows(entry)).collect::<Vec<_>>()))
+            .collect();
         for url in self.relay_map.urls::<Vec<RelayUrl>>() {
             if let Some(config) = self.relay_map.get(&url) {
                 let routes = entries
@@ -2316,6 +2334,7 @@ mod tests {
             secret_key,
             proxy_url: None,
             relay_udp: false,
+            relay_allowlist: None,
             dns_resolver: DnsResolver::new(),
             server_config,
             tls_config: CaTlsConfig::default()
@@ -2331,6 +2350,22 @@ mod tests {
             static_config,
             configured_addrs: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn relay_allowlist_cannot_be_expanded_by_insert_or_shared_map() {
+        let mut opts = default_options(&mut rand::rng());
+        let forbidden: iroh_base::RelayUrl = "http://127.0.0.1:12341".parse().unwrap();
+        let map: iroh_relay::RelayMap = [forbidden.clone()].into_iter().collect();
+        opts.transports.push(TransportConfig::Relay { relay_map: map.clone(), is_user_defined: true });
+        opts.relay_allowlist = Some(Default::default());
+        let endpoint = EndpointInner::bind(opts).await.unwrap();
+        assert!(endpoint.relay_map.is_empty(), "home and net-report map must obey the empty ceiling");
+        let config = Arc::new(iroh_relay::RelayConfig::from(forbidden.clone()));
+        map.insert(forbidden.clone(), config.clone());
+        endpoint.insert_relay(forbidden, config).await;
+        assert!(endpoint.relay_map.is_empty(), "insert or external map mutation widened the ceiling");
+        endpoint.close().await;
     }
 
     #[instrument(skip_all, fields(me = %ep.id().fmt_short()))]
@@ -2736,6 +2771,7 @@ mod tests {
             dns_resolver,
             proxy_url: None,
             relay_udp: false,
+            relay_allowlist: None,
             server_config,
             tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())

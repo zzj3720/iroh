@@ -3190,7 +3190,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.3.0"
-source = "git+https://github.com/zzj3720/noq?rev=d578f818ad7580c49691f26d5ccf8cc3afcc026a#d578f818ad7580c49691f26d5ccf8cc3afcc026a"
+source = "git+https://github.com/CommaBot/noq?rev=ec127b45ba708e20e4e192b8392e85ecd136fe06#ec127b45ba708e20e4e192b8392e85ecd136fe06"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",

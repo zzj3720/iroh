@@ -1324,9 +1324,9 @@ impl TransportsSender {
                 // handed on, under one read of them (`set` waits for it, never the other way): once a set is changed, no
                 // datagram is handed on by the one before. A send that is pending is looked at anew when polled again.
                 let policy = relay_policies.read();
-                if !RelayPolicies::allows_in(&policy, endpoint_id, url) {
+                if !relay_policies.allowlist.allows(url) || !RelayPolicies::allows_in(&policy, endpoint_id, url) {
                     relay_policies.counted(url, endpoint_id, false);
-                    trace!(%network_path, "relay disabled for this remote: dropped");
+                    trace!(%network_path, "relay disallowed by endpoint or remote policy: dropped");
                     return Poll::Ready(Ok(()));
                 }
                 let mut has_valid_sender = false;
@@ -1633,5 +1633,58 @@ impl noq::UdpSender for Sender {
 
     fn max_transmit_segments(&self) -> NonZeroUsize {
         self.sender.max_transmit_segments
+    }
+}
+
+#[cfg(test)]
+mod relay_allowlist_tests {
+    use super::*;
+    use crate::socket::relay_policy::RelayAllowlist;
+    use futures_util::{FutureExt, StreamExt};
+
+    #[tokio::test]
+    async fn relay_allowlist_enforced_before_sender_fallback() {
+        let allowed: RelayUrl = "http://127.0.0.1:12340".parse().unwrap();
+        let forbidden: RelayUrl = "http://127.0.0.1:12341".parse().unwrap();
+        let remote = iroh_base::SecretKey::from([7; 32]).public();
+        let (mut sender, mut queued) = TransportsSender::with_bounded_relay_for_test(8);
+        sender.relay_policies = RelayPolicies::with_allowlist(RelayAllowlist::new(Some([allowed.clone()].into())));
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let transmit = Transmit { ecn: None, contents: b"opaque packet", segment_size: None };
+        // Concrete addresses bypass lookup: cached paths and discovery use this same send entry.
+        for url in [&forbidden, &allowed, &forbidden] {
+            let path = FourTuple::Relay {url: url.clone(), endpoint_id: remote};
+            assert!(matches!(Pin::new(&mut sender).poll_send(&mut cx, &path, &transmit), Poll::Ready(Ok(()))));
+        }
+        assert_eq!(queued.next().now_or_never(), Some(Some(())));
+        assert!(queued.next().now_or_never().is_none(), "unlisted URL reached the relay sender queue");
+        assert_eq!(sender.relay_policies.datagrams(&forbidden, &remote).sent, 0);
+        assert_eq!(sender.relay_policies.datagrams(&forbidden, &remote).refused, 2);
+        assert_eq!(sender.relay_policies.datagrams(&allowed, &remote).sent, 1);
+        // The endpoint ceiling and per-remote deny set compose; clearing the latter cannot widen it.
+        sender.relay_policies.set(remote, [allowed.clone()].into());
+        let path = FourTuple::Relay {url: allowed, endpoint_id: remote};
+        assert!(matches!(Pin::new(&mut sender).poll_send(&mut cx, &path, &transmit), Poll::Ready(Ok(()))));
+        assert!(queued.next().now_or_never().is_none());
+        sender.relay_policies.set(remote, Default::default());
+        let path = FourTuple::Relay {url: forbidden.clone(), endpoint_id: remote};
+        assert!(matches!(Pin::new(&mut sender).poll_send(&mut cx, &path, &transmit), Poll::Ready(Ok(()))));
+        assert!(queued.next().now_or_never().is_none(), "clearing a remote deny set widened the endpoint ceiling");
+        assert_eq!(sender.relay_policies.datagrams(&forbidden, &remote).refused, 3);
+    }
+
+    #[tokio::test]
+    async fn relay_allowlist_empty_denies_but_unconfigured_keeps_existing_behavior() {
+        let url: RelayUrl = "http://127.0.0.1:12340".parse().unwrap();
+        let remote = iroh_base::SecretKey::from([7; 32]).public();
+        let (mut sender, mut queued) = TransportsSender::with_bounded_relay_for_test(8);
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        let path = FourTuple::Relay { url, endpoint_id: remote };
+        let transmit = Transmit {ecn: None, contents: b"packet", segment_size: None};
+        assert!(matches!(Pin::new(&mut sender).poll_send(&mut cx, &path, &transmit), Poll::Ready(Ok(()))));
+        assert_eq!(queued.next().now_or_never(), Some(Some(())));
+        sender.relay_policies = RelayPolicies::with_allowlist(RelayAllowlist::new(Some(Default::default())));
+        assert!(matches!(Pin::new(&mut sender).poll_send(&mut cx, &path, &transmit), Poll::Ready(Ok(()))));
+        assert!(queued.next().now_or_never().is_none());
     }
 }

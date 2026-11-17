@@ -40,7 +40,7 @@ missing_debug_implementations = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)", "cfg(iroh_loom)", "cfg(skip_patchbay)"] }
 
 [patch.crates-io]
-noq-proto = { git = "https://github.com/zzj3720/noq", rev = "d578f818ad7580c49691f26d5ccf8cc3afcc026a" }
+noq-proto = { git = "https://github.com/CommaBot/noq", rev = "ec127b45ba708e20e4e192b8392e85ecd136fe06" }
 
 [workspace.lints.clippy]
 unused-async = "warn"

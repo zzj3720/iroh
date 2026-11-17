@@ -1213,6 +1213,7 @@ pub(crate) struct Config {
     /// Per-relay configuration. Consulted when starting a connection to
     /// look up the auth token and any future per-relay options.
     pub relay_map: RelayMap,
+    pub relay_allowlist: crate::socket::relay_policy::RelayAllowlist,
     /// ember: relays of `relay_map` this actor is not home on, another relay transport's
     /// (`Builder::home_on_every_relay`: the first transport has the endpoint's whole map, relays inserted later with it,
     /// the others one relay each). Shared with the transport's sender (`RelaySender::owns`): a relay removed from the
@@ -1461,7 +1462,10 @@ impl RelayActor {
                 }
             }
             RelayActorMessage::SetEntries(entries) => {
-                let entries: BTreeMap<_, _> = entries.into_iter().collect();
+                let entries: BTreeMap<_, _> = entries.into_iter()
+                    .filter(|(url, _)| self.config.relay_allowlist.allows(url))
+                    .map(|(url, list)| (url, list.into_iter().filter(|entry| self.config.relay_allowlist.allows(entry)).collect::<Vec<_>>()))
+                    .collect();
                 for (url, handle) in &self.active_relays {
                     let list = entries.get(url).cloned().unwrap_or_default();
                     handle
@@ -1553,6 +1557,7 @@ impl RelayActor {
         let handle = self
             .active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint)
             .await;
+        let Some(handle) = handle else { return; };
         match handle.datagrams_send_queue.try_send(item) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1569,7 +1574,7 @@ impl RelayActor {
     fn homes(&self) -> Vec<RelayUrl> {
         let mut urls = self.config.relay_map.urls::<Vec<RelayUrl>>();
         let excludes = self.config.excludes.read().expect("poisoned");
-        urls.retain(|u| !excludes.contains(u));
+        urls.retain(|u| !excludes.contains(u) && self.config.relay_allowlist.allows(u));
         urls
     }
 
@@ -1631,7 +1636,7 @@ impl RelayActor {
         }))
         .await;
         // Ensure we have an ActiveRelayActor for the current home relay.
-        self.active_relay_handle(home_url);
+        let _ = self.active_relay_handle(home_url);
     }
 
     /// Returns the handle for the [`ActiveRelayActor`] to reach `remote_endpoint`.
@@ -1643,9 +1648,10 @@ impl RelayActor {
         &mut self,
         url: &RelayUrl,
         remote_endpoint: &EndpointId,
-    ) -> ActiveRelayHandle {
+    ) -> Option<ActiveRelayHandle> {
+        if !self.config.relay_allowlist.allows(url) { return None; }
         if let Some(handle) = self.active_relays.get(url) {
-            return handle.clone();
+            return Some(handle.clone());
         }
 
         let mut found_relay: Option<RelayUrl> = None;
@@ -1682,8 +1688,9 @@ impl RelayActor {
     }
 
     /// Returns the handle of the [`ActiveRelayActor`].
-    fn active_relay_handle(&mut self, url: RelayUrl) -> ActiveRelayHandle {
-        match self.active_relays.get(&url) {
+    fn active_relay_handle(&mut self, url: RelayUrl) -> Option<ActiveRelayHandle> {
+        if !self.config.relay_allowlist.allows(&url) { return None; }
+        Some(match self.active_relays.get(&url) {
             Some(e) => e.clone(),
             None => {
                 let handle = self.start_active_relay(url.clone());
@@ -1698,7 +1705,7 @@ impl RelayActor {
                 self.log_active_relay();
                 handle
             }
-        }
+        })
     }
 
     fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
@@ -1811,7 +1818,7 @@ impl RelayActor {
 
         // Make sure home relay exists
         if let Some(status) = self.config.my_relay.get() {
-            self.active_relay_handle(status.url().clone());
+            let _ = self.active_relay_handle(status.url().clone());
         }
         self.log_active_relay();
     }
@@ -1894,6 +1901,29 @@ mod tests {
     };
     use crate::socket::transports::relay::RELAY_DATAGRAM_QUEUE;
     use crate::{dns::DnsResolver, test_utils};
+
+    #[tokio::test]
+    async fn relay_allowlist_prevents_unlisted_actor_and_home_connections() {
+        let allowed: RelayUrl = "http://127.0.0.1:12340".parse().unwrap();
+        let forbidden: RelayUrl = "http://127.0.0.1:12341".parse().unwrap();
+        let allowlist = crate::socket::relay_policy::RelayAllowlist::new(Some([allowed.clone()].into()));
+        let original: iroh_relay::RelayMap = [allowed.clone(), forbidden.clone()].into_iter().collect();
+        let config = Config {
+            my_relay: HomeRelayWatch::default(), secret_key: SecretKey::generate(),
+            dns_resolver: DnsResolver::new(), proxy_url: None, relay_udp: Default::default(),
+            ipv6_reported: Arc::new(AtomicBool::new(false)),
+            tls_config: CaTlsConfig::insecure_skip_verify().client_config(default_provider()).unwrap(),
+            metrics: Default::default(), relay_map: original,
+            relay_allowlist: allowlist, excludes: Default::default(), own: None, others: vec![],
+        };
+        let (received, _rx) = mpsc::channel(8);
+        let mut actor = RelayActor::new(config, received, CancellationToken::new());
+        assert!(actor.active_relay_handle(forbidden.clone()).is_none());
+        assert!(actor.active_relay_handle_for_endpoint(&forbidden, &SecretKey::generate().public()).await.is_none());
+        assert!(actor.active_relays.is_empty(), "unlisted URL created a relay connection actor");
+        assert!(actor.active_relay_tasks.is_empty());
+        assert_eq!(actor.homes(), vec![allowed]);
+    }
 
     /// Starts a new [`ActiveRelayActor`].
     #[allow(clippy::too_many_arguments)]
@@ -2516,6 +2546,7 @@ mod tests {
                 .expect("infallible"),
             metrics: Default::default(),
             relay_map,
+            relay_allowlist: Default::default(),
             excludes: Default::default(),
             own: None,
             others: Vec::new(),

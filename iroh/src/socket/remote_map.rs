@@ -22,7 +22,7 @@ pub use self::remote_state::{
 };
 #[cfg(feature = "unstable-custom-transports")]
 pub use self::remote_state::{
-    PathSelection, PathSelectionContext, PathSelectionData, PathSelector,
+    PathSelection, PathSelectionConnection, PathSelectionContext, PathSelectionData, PathSelector,
 };
 #[cfg(not(feature = "unstable-custom-transports"))]
 pub(crate) use self::remote_state::{

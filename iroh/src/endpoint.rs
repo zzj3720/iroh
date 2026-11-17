@@ -39,7 +39,7 @@ pub mod transports {
     //! </div>
 
     pub use super::socket::{
-        remote_map::{PathSelection, PathSelectionContext, PathSelectionData, PathSelector},
+        remote_map::{PathSelection, PathSelectionConnection, PathSelectionContext, PathSelectionData, PathSelector},
         transports::{
             Addr, AddrKind, FourTuple, RecvInfo, Transmit,
             custom::{CustomEndpoint, CustomSender, CustomTransport},
@@ -139,6 +139,7 @@ pub struct Builder {
     proxy_url: Option<Url>,
     /// ember: [`Builder::relay_udp`].
     relay_udp: bool,
+    relay_allowlist: Option<BTreeSet<RelayUrl>>,
     ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
     dns_resolver: Option<DnsResolver>,
@@ -208,6 +209,7 @@ impl Builder {
             addr_filter: None,
             proxy_url: None,
             relay_udp: false,
+            relay_allowlist: None,
             ca_tls_config: None,
             #[cfg(not(wasm_browser))]
             dns_resolver: None,
@@ -273,6 +275,7 @@ impl Builder {
             address_lookup_user_data: self.address_lookup_user_data,
             proxy_url: self.proxy_url,
             relay_udp: self.relay_udp,
+            relay_allowlist: self.relay_allowlist,
             #[cfg(not(wasm_browser))]
             dns_resolver,
             server_config,
@@ -509,6 +512,17 @@ impl Builder {
     pub fn clear_ip_transports(mut self) -> Self {
         self.transports
             .retain(|t| !matches!(t, TransportConfig::Ip { .. }));
+        self
+    }
+
+    /// ember: restrict every relay connection and send to these URLs for this endpoint's lifetime.
+    ///
+    /// Without this option, learned relay URLs are allowed as before. An empty set permits only
+    /// IP and custom transports. This ceiling also applies to home relays, forwarding entrances,
+    /// address lookup, cached addresses, and relays inserted after binding. IP and custom
+    /// transports are unchanged. The ceiling cannot be widened after binding.
+    pub fn relay_allowlist(mut self, relays: impl IntoIterator<Item = RelayUrl>) -> Self {
+        self.relay_allowlist = Some(relays.into_iter().collect());
         self
     }
 
@@ -1077,7 +1091,8 @@ impl Endpoint {
     ///
     /// Replacing and returning any existing configuration for [`RelayUrl`].
     ///
-    /// Will also return `None` if the endpoint is closed.
+    /// Will also return `None` if the endpoint is closed or the URL is outside
+    /// the ceiling set by [`Builder::relay_allowlist`].
     pub async fn insert_relay(
         &self,
         relay: RelayUrl,
@@ -2607,6 +2622,7 @@ mod tests {
             Endpoint::builder(presets::N0)
                 .alpns(vec![TEST_ALPN.to_vec()])
                 .relay_mode(RelayMode::Disabled)
+                .relay_allowlist([])
                 .bind()
                 .await?
         };

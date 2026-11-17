@@ -3,11 +3,64 @@
 //! system settings or its flight window. Physical Macs and loopback connections retain Tokio's normal I/O.
 //! Capping write() alone is insufficient: a closed congestion window coalesces queued writes.
 
+use std::{io, net::SocketAddr};
+
 #[cfg(not(target_os = "macos"))]
 pub(super) use tokio::net::TcpStream;
 
 #[cfg(target_os = "macos")]
 pub(super) use macos::TcpStream;
+
+/// A relay's TCP connection to `addr`, marked with the process's DSCP (`super::set_dscp`).
+#[cfg(not(target_os = "macos"))]
+pub(super) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+    connect_marked(addr, super::dscp()).await
+}
+
+/// A relay's TCP connection to `addr`, marked with the process's DSCP (`super::set_dscp`).
+#[cfg(target_os = "macos")]
+pub(super) async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+    TcpStream::connect(addr).await
+}
+
+/// ember: a TCP connection to `addr` whose socket is marked with `dscp` before it connects (its SYN marked too); with
+/// none, Tokio's own connect, as before.
+async fn connect_marked(addr: SocketAddr, dscp: u8) -> io::Result<tokio::net::TcpStream> {
+    if dscp == 0 {
+        return tokio::net::TcpStream::connect(addr).await;
+    }
+    socket_for(addr, dscp)?.connect(addr).await
+}
+
+/// ember: the socket a marked connection to `addr` is made from, marked and not yet connected.
+fn socket_for(addr: SocketAddr, dscp: u8) -> io::Result<tokio::net::TcpSocket> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    mark(&socket, addr, dscp)?;
+    Ok(socket)
+}
+
+/// ember: `dscp` on a socket that sends to `addr`: IPv4's TOS byte or IPv6's traffic class, its ECN bits 0 (a relay's
+/// TCP and UDP set none). A mark that cannot be set is an error, never an unmarked socket.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+pub(super) fn mark<S: std::os::fd::AsFd>(socket: &S, addr: SocketAddr, dscp: u8) -> io::Result<()> {
+    let socket = socket2::SockRef::from(socket);
+    let tos = u32::from(dscp & 0x3f) << 2;
+    if addr.is_ipv4() {
+        socket.set_tos_v4(tos)
+    } else {
+        socket.set_tclass_v6(tos)
+    }
+}
+
+/// ember: elsewhere no relay socket is marked (`super::set_dscp`).
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+pub(super) fn mark<S>(_socket: &S, _addr: SocketAddr, _dscp: u8) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -54,7 +107,7 @@ mod macos {
 
     impl TcpStream {
         pub(crate) async fn connect(addr: SocketAddr) -> io::Result<Self> {
-            let inner = tokio::net::TcpStream::connect(addr).await?;
+            let inner = super::connect_marked(addr, crate::client::dscp()).await?;
             // A local proxy owns its external TCP carrier; bounding our loopback hop cannot repair that.
             let loopback = match addr.ip() {
                 std::net::IpAddr::V4(ip) => ip.is_loopback(),
@@ -341,6 +394,75 @@ mod macos {
             })
             .await
             .expect("a reset must not strand a writer waiting for readiness");
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_os = "macos")
+))]
+mod mark_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use socket2::SockRef;
+    use tokio::net::TcpListener;
+
+    use super::{connect_marked, socket_for};
+
+    /// The byte a socket to `addr` carries: IPv4's TOS, IPv6's traffic class.
+    fn byte_of<S: std::os::fd::AsFd>(socket: &S, addr: SocketAddr) -> u32 {
+        let socket = SockRef::from(socket);
+        if addr.is_ipv4() {
+            socket.tos_v4().unwrap()
+        } else {
+            socket.tclass_v6().unwrap()
+        }
+    }
+
+    async fn listener(ip: std::net::IpAddr) -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    /// The socket is marked before it connects, so the SYN is (an unmarked SYN taken by a proxy, the marked packets
+    /// after it not, breaks the connection), and the connection keeps the mark: IPv4 and IPv6.
+    #[tokio::test]
+    async fn a_marked_dial_is_marked_before_it_connects() {
+        for ip in [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()] {
+            let (held, addr) = listener(ip).await;
+            let socket = socket_for(addr, 43).unwrap();
+            assert_eq!(
+                byte_of(&socket, addr),
+                43 << 2,
+                "{addr}: marked before connecting"
+            );
+            let stream = socket.connect(addr).await.unwrap();
+            assert_eq!(
+                byte_of(&stream, addr),
+                43 << 2,
+                "{addr}: still marked once connected"
+            );
+            drop(held);
+
+            let (_listener, addr) = listener(ip).await;
+            let stream = connect_marked(addr, 43).await.unwrap();
+            assert_eq!(
+                byte_of(&stream, addr),
+                43 << 2,
+                "{addr}: the dial's connection"
+            );
+        }
+    }
+
+    /// With no DSCP the dial is Tokio's own, its socket unmarked.
+    #[tokio::test]
+    async fn an_unmarked_dial_has_no_mark() {
+        for ip in [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()] {
+            let (_listener, addr) = listener(ip).await;
+            let stream = connect_marked(addr, 0).await.unwrap();
+            assert_eq!(byte_of(&stream, addr), 0, "{addr}");
         }
     }
 }

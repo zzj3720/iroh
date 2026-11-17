@@ -23,7 +23,7 @@ use tracing::{Instrument, error, info_span};
 
 use super::{
     streams::{MaybeTlsStream, ProxyStream},
-    tcp::TcpStream,
+    tcp::{self, TcpStream},
     *,
 };
 use crate::defaults::timeouts::*;
@@ -284,7 +284,7 @@ async fn dial_happy_eyeballs(
             dials.push(
                 async move {
                     trace!("connecting TCP stream");
-                    let stream = time::timeout(DIAL_ENDPOINT_TIMEOUT, TcpStream::connect(addr))
+                    let stream = time::timeout(DIAL_ENDPOINT_TIMEOUT, tcp::connect(addr))
                         .await
                         .map_err(DialError::from)
                         .and_then(|res| res.map_err(DialError::from))

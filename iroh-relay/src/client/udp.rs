@@ -41,6 +41,20 @@ pub(crate) struct UdpHalf {
     _task: Arc<AbortOnDropHandle<()>>,
 }
 
+/// ember: the way's socket, for `relay`'s family, marked with `dscp` (`super::set_dscp`) before anything is sent on it;
+/// with none, as before.
+async fn bind(relay: SocketAddr, dscp: u8) -> std::io::Result<UdpSocket> {
+    let any = match relay {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = UdpSocket::bind(any).await?;
+    if dscp != 0 {
+        super::tcp::mark(&socket, relay, dscp)?;
+    }
+    Ok(socket)
+}
+
 impl UdpLink {
     /// Opens the way to `relay` and starts saying hello; the datagrams it brings come on the receiver.
     pub(crate) async fn start(
@@ -48,11 +62,7 @@ impl UdpLink {
         token: Token,
         key_cache: KeyCache,
     ) -> std::io::Result<(UdpHalf, mpsc::Receiver<RelayToClientMsg>)> {
-        let any = match relay {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        let socket = UdpSocket::bind(any).await?;
+        let socket = bind(relay, super::dscp()).await?;
         let link = Arc::new(UdpLink {
             socket,
             relay,
@@ -167,6 +177,38 @@ impl UdpLink {
             }
             if tx.is_closed() {
                 return;
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_os = "macos")
+))]
+mod mark_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use socket2::SockRef;
+
+    use super::bind;
+
+    /// The way's socket is marked as it is bound, before its first hello, and unmarked with no DSCP: IPv4 and IPv6.
+    #[tokio::test]
+    async fn the_way_is_marked_before_it_sends() {
+        for relay in [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 9)),
+        ] {
+            for (dscp, byte) in [(43u8, 43u32 << 2), (0, 0)] {
+                let socket = bind(relay, dscp).await.unwrap();
+                let socket = SockRef::from(&socket);
+                let got = if relay.is_ipv4() {
+                    socket.tos_v4().unwrap()
+                } else {
+                    socket.tclass_v6().unwrap()
+                };
+                assert_eq!(got, byte, "{relay} with DSCP {dscp}");
             }
         }
     }

@@ -46,6 +46,27 @@ mod udp;
 #[cfg(not(wasm_browser))]
 mod util;
 
+// ember: the DSCP this process's relay connections are marked with (`set_dscp`), 0 for none.
+static DSCP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// ember: marks every relay connection this process opens from now on, its TCP dial and its UDP way, with the DSCP
+/// `dscp` (the six high bits of IPv4's TOS byte and of IPv6's traffic class), for a network that routes packets so
+/// marked their own way; only its six low bits are taken. The TCP socket is marked before it connects, so its SYN is
+/// too: a router that took an unmarked SYN one way and the marked packets after it another would break the connection.
+/// 0, as at the start, marks none: the sockets are then as they were. Process-wide, as it is a property of the
+/// machine's network, set before any endpoint binds; it changes no connection already open.
+///
+/// Linux, Android and macOS; elsewhere it has no effect.
+pub fn set_dscp(dscp: u8) {
+    DSCP.store(dscp & 0x3f, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ember: what `set_dscp` set.
+#[cfg(not(wasm_browser))]
+pub(crate) fn dscp() -> u8 {
+    DSCP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Connection errors.
 ///
 /// `ConnectError` contains `DialError`, errors that can occur while dialing the

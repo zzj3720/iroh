@@ -292,6 +292,9 @@ pub use iroh_base::{
 #[cfg(not(wasm_browser))]
 pub use iroh_dns::dns;
 pub use iroh_dns::endpoint_info;
+/// ember: marks the relay connections of every endpoint of this process (their TCP dial, its SYN too, and their UDP
+/// way) with a DSCP; see [`iroh_relay::client::set_dscp`]. The endpoints' own datagrams are noq-udp's to mark.
+pub use iroh_relay::client::set_dscp as set_relay_dscp;
 pub use iroh_relay::{RelayConfig, RelayMap};
 pub use n0_watcher::Watcher;
 pub use net_report::{NetReportConfig, TIMEOUT as NET_REPORT_TIMEOUT};

@@ -52,7 +52,9 @@ use n0_future::{
 };
 use n0_watcher::Watchable;
 use netwatch::interfaces;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, debug, error, event, info, info_span, instrument, trace, warn};
 use url::Url;
@@ -94,6 +96,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Recheck alternate entrances to one relay without registering the endpoint's key on it twice.
 const ENTRY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// ember: how long closing a relay connection gracefully may take; a dead one would otherwise hold its actor.
+const CLIENT_SINK_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Time after which the [`ActiveRelayActor`] will drop undeliverable datagrams.
 ///
 /// When the [`ActiveRelayActor`] is not connected it can not deliver datagrams.  However it
@@ -134,8 +139,9 @@ const UNDELIVERABLE_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug)]
 struct ActiveRelayActor {
     // The inboxes and channels this actor communicates over.
-    /// Inbox for messages which should be handled without any blocking.
-    prio_inbox: mpsc::Receiver<ActiveRelayPrioMessage>,
+    /// ember: the endpoints reachable through this relay while connected, read by the [`RelayActor`] without asking
+    /// this actor (`ActiveRelayHandle::endpoints_present`).
+    endpoints_present: EndpointsPresent,
     /// Inbox for messages which involve sending to the relay server.
     inbox: mpsc::Receiver<ActiveRelayMessage>,
     /// Queue for received relay datagrams.
@@ -201,22 +207,26 @@ enum ActiveRelayMessage {
     PingServer(oneshot::Sender<()>),
 }
 
-/// Messages for the [`ActiveRelayActor`] which should never block.
-///
-/// Most messages in the [`ActiveRelayMessage`] enum trigger sending to the relay server,
-/// which can be blocking.  So the actor may not always be processing that inbox.  Messages
-/// here are processed immediately.
-#[derive(Debug)]
-enum ActiveRelayPrioMessage {
-    /// Returns whether or not this relay can reach the EndpointId.
-    HasEndpointRoute(EndpointId, oneshot::Sender<bool>),
+/// ember: the endpoints reachable through one relay connection, written by its [`ActiveRelayActor`] and read by the
+/// [`RelayActor`] when it looks for a relay that reaches an endpoint. Upstream the [`RelayActor`] asked each actor
+/// (`HasEndpointRoute`) and waited for every answer; one actor dialing again, backing off or closing a dead connection
+/// held every datagram of the transport, to every relay, until it answered.
+type EndpointsPresent = Arc<std::sync::RwLock<BTreeSet<EndpointId>>>;
+
+/// ember: empties [`EndpointsPresent`] as a connection ends, however it ends (returned, failed, or cancelled).
+struct ClearOnDrop(EndpointsPresent);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.write().expect("poisoned").clear();
+    }
 }
 
 /// Configuration needed to start an [`ActiveRelayActor`].
 #[derive(Debug)]
 struct ActiveRelayActorOptions {
     url: RelayUrl,
-    prio_inbox_: mpsc::Receiver<ActiveRelayPrioMessage>,
+    endpoints_present: EndpointsPresent,
     inbox: mpsc::Receiver<ActiveRelayMessage>,
     relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
     relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
@@ -293,7 +303,7 @@ impl ActiveRelayActor {
     fn new(opts: ActiveRelayActorOptions) -> Self {
         let ActiveRelayActorOptions {
             url,
-            prio_inbox_: prio_inbox,
+            endpoints_present,
             inbox,
             relay_datagrams_send,
             relay_datagrams_recv,
@@ -306,7 +316,7 @@ impl ActiveRelayActor {
         let udp = connection_opts.udp.clone();
         let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts.clone());
         ActiveRelayActor {
-            prio_inbox,
+            endpoints_present,
             inbox,
             relay_datagrams_recv,
             relay_datagrams_send,
@@ -536,7 +546,9 @@ impl ActiveRelayActor {
                     break;
                 };
                 debug!("retry in {delay:?}");
-                time::sleep(delay).await;
+                if !self.sleep_backoff(delay).await {
+                    break;
+                }
             } else {
                 // If the relay connection remained established long enough so that we received a pong
                 // from the relay server, we reset the backoff and attempt to reconnect immediately.
@@ -544,6 +556,56 @@ impl ActiveRelayActor {
             }
         }
         debug!("exiting");
+    }
+
+    /// ember: waits `delay` before dialing again, while still taking its inbox and stopping when told. Upstream slept
+    /// through it (up to 16 s): it neither stopped nor took a message meanwhile. Returns `false` if the actor is to
+    /// exit.
+    async fn sleep_backoff(&mut self, delay: Duration) -> bool {
+        let sleep = time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.stop_token.cancelled() => {
+                    debug!("Shutdown.");
+                    return false;
+                }
+                msg = self.inbox.recv() => {
+                    let Some(msg) = msg else {
+                        debug!("Inbox closed, shutdown.");
+                        return false;
+                    };
+                    // As `run_dialing` takes them; the next dial uses the entrance chosen.
+                    match msg {
+                        ActiveRelayMessage::SetHomeRelay(is_home) => {
+                            self.set_home_relay(is_home);
+                        }
+                        ActiveRelayMessage::EntrySamples(samples) => {
+                            self.last_samples = samples.clone();
+                            if let Some(access) = self.choose_entry(&samples) {
+                                self.set_access(access);
+                            }
+                        }
+                        ActiveRelayMessage::UpdateEntries(entries, sender) => {
+                            if self.update_entries(entries, sender) {
+                                self.set_access(self.url.clone());
+                            }
+                        }
+                        ActiveRelayMessage::CheckConnection { .. } | ActiveRelayMessage::Reconnect => {}
+                        #[cfg(test)]
+                        ActiveRelayMessage::GetLocalAddr(sender) => {
+                            sender.send(None).ok();
+                        }
+                        #[cfg(test)]
+                        ActiveRelayMessage::PingServer(sender) => {
+                            drop(sender);
+                        }
+                    }
+                }
+                _ = &mut sleep => return true,
+            }
+        }
     }
 
     fn build_backoff() -> impl Backoff {
@@ -628,17 +690,6 @@ impl ActiveRelayActor {
                 _ = self.stop_token.cancelled() => {
                     debug!("Shutdown.");
                     break None;
-                }
-                msg = self.prio_inbox.recv() => {
-                    let Some(msg) = msg else {
-                        warn!("Priority inbox closed, shutdown.");
-                        break None;
-                    };
-                    match msg {
-                        ActiveRelayPrioMessage::HasEndpointRoute(_peer, sender) => {
-                            sender.send(false).ok();
-                        }
-                    }
                 }
                 res = &mut dialing_fut => {
                     match res {
@@ -762,9 +813,9 @@ impl ActiveRelayActor {
         let (mut client_stream, client_sink) = client.split();
         let mut client_sink = client_sink.sink_map_err(|e| e!(RunError::ClientStreamWrite, e));
 
+        let _endpoints_present = ClearOnDrop(self.endpoints_present.clone());
         let mut state = ConnectedRelayState {
             ping_tracker: PingTracker::default(),
-            endpoints_present: BTreeSet::new(),
             last_packet_src: None,
             pong_pending: None,
             established: false,
@@ -794,18 +845,6 @@ impl ActiveRelayActor {
                 _ = self.stop_token.cancelled() => {
                     debug!("Shutdown.");
                     break Ok(None);
-                }
-                msg = self.prio_inbox.recv() => {
-                    let Some(msg) = msg else {
-                        warn!("Priority inbox closed, shutdown.");
-                        break Ok(None);
-                    };
-                    match msg {
-                        ActiveRelayPrioMessage::HasEndpointRoute(peer, sender) => {
-                            let has_peer = state.endpoints_present.contains(&peer);
-                            sender.send(has_peer).ok();
-                        }
-                    }
                 }
                 _ = state.ping_tracker.timeout() => {
                     break Err(e!(RunError::PingTimeout));
@@ -954,10 +993,13 @@ impl ActiveRelayActor {
             }
         };
 
-        if matches!(res, Ok(None))
-            && let Err(err) = client_sink.close().await
-        {
-            debug!("Failed to close client sink gracefully: {err:#}");
+        // ember: bounded, a dead connection does not hold the actor (and its inboxes) up.
+        if matches!(res, Ok(None)) {
+            match time::timeout(CLIENT_SINK_CLOSE_TIMEOUT, client_sink.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => debug!("Failed to close client sink gracefully: {err:#}"),
+                Err(_) => debug!(?CLIENT_SINK_CLOSE_TIMEOUT, "Timed out closing client sink"),
+            }
         }
 
         res.map_err(|err| state.map_err(err))
@@ -977,9 +1019,12 @@ impl ActiveRelayActor {
                     .map(|p| *p != remote_endpoint_id)
                     .unwrap_or(true)
                 {
-                    // Avoid map lookup with high throughput single peer.
+                    // Avoid map lookup (and its lock) with high throughput single peer.
                     state.last_packet_src = Some(remote_endpoint_id);
-                    state.endpoints_present.insert(remote_endpoint_id);
+                    self.endpoints_present
+                        .write()
+                        .expect("poisoned")
+                        .insert(remote_endpoint_id);
                 }
 
                 if let Err(err) = self.relay_datagrams_recv.try_send(RelayRecvDatagram {
@@ -991,7 +1036,14 @@ impl ActiveRelayActor {
                 }
             }
             RelayToClientMsg::EndpointGone(endpoint_id) => {
-                state.endpoints_present.remove(&endpoint_id);
+                self.endpoints_present
+                    .write()
+                    .expect("poisoned")
+                    .remove(&endpoint_id);
+                // The next datagram from it registers it again.
+                if state.last_packet_src == Some(endpoint_id) {
+                    state.last_packet_src = None;
+                }
             }
             RelayToClientMsg::Ping(data) => state.pong_pending = Some(data),
             RelayToClientMsg::Pong(data) => {
@@ -1068,18 +1120,6 @@ impl ActiveRelayActor {
                 _ = &mut timeout => {
                     break Err(e!(RunError::SendTimeout));
                 }
-                msg = self.prio_inbox.recv() => {
-                    let Some(msg) = msg else {
-                        warn!("Priority inbox closed, shutdown.");
-                        break Ok(());
-                    };
-                    match msg {
-                        ActiveRelayPrioMessage::HasEndpointRoute(peer, sender) => {
-                            let has_peer = state.endpoints_present.contains(&peer);
-                            sender.send(has_peer).ok();
-                        }
-                    }
-                }
                 res = &mut sending_fut => {
                     match res {
                         Ok(_) => break Ok(()),
@@ -1117,11 +1157,9 @@ impl ActiveRelayActor {
 struct ConnectedRelayState {
     /// Tracks pings we have sent, awaits pong replies.
     ping_tracker: PingTracker,
-    /// Endpoints which are reachable via this relay server.
-    endpoints_present: BTreeSet<EndpointId>,
     /// The [`EndpointId`] from whom we received the last packet.
     ///
-    /// This is to avoid a slower lookup in the [`ConnectedRelayState::endpoints_present`] map
+    /// This is to avoid a slower lookup in [`ActiveRelayActor::endpoints_present`]
     /// when we are only communicating to a single remote endpoint.
     last_packet_src: Option<EndpointId>,
     /// A pong we need to send ASAP.
@@ -1531,9 +1569,29 @@ impl RelayActor {
         if self.config.own.as_ref() == Some(&url) {
             self.config.relay_map.insert(url.clone(), config);
         } else if self.config.others.contains(&url) {
-            let mut excludes = self.config.excludes.write().expect("poisoned");
-            if !excludes.contains(&url) {
-                excludes.push(url.clone());
+            {
+                let mut excludes = self.config.excludes.write().expect("poisoned");
+                if !excludes.contains(&url) {
+                    excludes.push(url.clone());
+                }
+            }
+            // ember: the first transport's map had `url` before this message, so it may have connected to it, even be
+            // home on it; another transport is home on it now, and two connections of one endpoint id to one relay
+            // displace each other (`SameEndpointIdConnected`). As `remove_relay`: its connection here ends, and home is
+            // chosen again below.
+            if let Some(handle) = self.active_relays.remove(&url) {
+                info!(%url, "relay inserted for another transport: its connection here ended");
+                handle.stop.cancel();
+                self.log_active_relay();
+            }
+            if self
+                .config
+                .my_relay
+                .get()
+                .is_some_and(|status| status.url() == &url)
+            {
+                info!(%url, "relay inserted for another transport: home here is chosen again");
+                self.config.my_relay.clear();
             }
         }
         if self.config.my_relay.get().is_none()
@@ -1554,9 +1612,7 @@ impl RelayActor {
     /// not answering) held every relay of this transport up to `UNDELIVERABLE_DATAGRAM_TIMEOUT`, 3 s, at a time.
     async fn try_send_datagram(&mut self, item: RelaySendItem) {
         let url = item.url.clone();
-        let handle = self
-            .active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint)
-            .await;
+        let handle = self.active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint);
         let Some(handle) = handle else { return; };
         match handle.datagrams_send_queue.try_send(item) {
             Ok(()) => {}
@@ -1644,7 +1700,7 @@ impl RelayActor {
     /// The endpoint is expected to be reachable on `url`, but if no [`ActiveRelayActor`] for
     /// `url` exists but another existing [`ActiveRelayActor`] already knows about the endpoint,
     /// that other endpoint is used.
-    async fn active_relay_handle_for_endpoint(
+    fn active_relay_handle_for_endpoint(
         &mut self,
         url: &RelayUrl,
         remote_endpoint: &EndpointId,
@@ -1654,35 +1710,21 @@ impl RelayActor {
             return Some(handle.clone());
         }
 
-        let mut found_relay: Option<RelayUrl> = None;
         // If we don't have an open connection to the remote endpoint's home relay, see if
         // we have an open connection to a relay endpoint where we'd heard from that peer
         // already.  E.g. maybe they dialed our home relay recently.
-        {
-            // Futures which return Some(RelayUrl) if the relay knows about the remote endpoint.
-            let check_futs = self.active_relays.iter().map(|(url, handle)| async move {
-                let (tx, rx) = oneshot::channel();
+        // ember: read from each connection's `endpoints_present`, asking no actor and waiting for none.
+        let found_relay = self
+            .active_relays
+            .iter()
+            .find(|(_, handle)| {
                 handle
-                    .prio_inbox_addr
-                    .send(ActiveRelayPrioMessage::HasEndpointRoute(
-                        *remote_endpoint,
-                        tx,
-                    ))
-                    .await
-                    .ok();
-                match rx.await {
-                    Ok(true) => Some(url.clone()),
-                    _ => None,
-                }
-            });
-            let mut futures = FuturesUnorderedBounded::from_iter(check_futs);
-            while let Some(maybe_url) = futures.next().await {
-                if maybe_url.is_some() {
-                    found_relay = maybe_url;
-                    break;
-                }
-            }
-        }
+                    .endpoints_present
+                    .read()
+                    .expect("poisoned")
+                    .contains(remote_endpoint)
+            })
+            .map(|(url, _)| url.clone());
         let url = found_relay.unwrap_or(url.clone());
         self.active_relay_handle(url)
     }
@@ -1733,13 +1775,13 @@ impl RelayActor {
 
         // ember: as many as the transport's queue holds, all of them maybe for this relay.
         let (send_datagram_tx, send_datagram_rx) = mpsc::channel(super::RELAY_DATAGRAM_QUEUE);
-        let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
+        let endpoints_present = EndpointsPresent::default();
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
         let stop = self.cancel_token.child_token();
         let opts = ActiveRelayActorOptions {
             url,
-            prio_inbox_: prio_inbox_rx,
+            endpoints_present: endpoints_present.clone(),
             inbox: inbox_rx,
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
@@ -1759,7 +1801,7 @@ impl RelayActor {
         );
         let handle = ActiveRelayHandle {
             stop,
-            prio_inbox_addr: prio_inbox_tx,
+            endpoints_present,
             inbox_addr: inbox_tx,
             datagrams_send_queue: send_datagram_tx,
         };
@@ -1858,7 +1900,8 @@ impl RelayActor {
 struct ActiveRelayHandle {
     /// ember: ends its actor (its relay removed: `RelayActor::remove_relay`).
     stop: CancellationToken,
-    prio_inbox_addr: mpsc::Sender<ActiveRelayPrioMessage>,
+    /// ember: the endpoints its connection reaches (`EndpointsPresent`).
+    endpoints_present: EndpointsPresent,
     inbox_addr: mpsc::Sender<ActiveRelayMessage>,
     datagrams_send_queue: mpsc::Sender<RelaySendItem>,
 }
@@ -1894,7 +1937,7 @@ mod tests {
     use tracing::{Instrument, info, info_span};
 
     use super::{
-        ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
+        ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayHandle, ActiveRelayMessage,
         Config, HomeRelayWatch, MAX_SEND_DATAGRAM_WAIT, RELAY_INACTIVE_CLEANUP_TIME, RelayActor,
         RelayConnectionOptions, RelayConnectionState, RelayRecvDatagram, RelaySendItem,
         UNDELIVERABLE_DATAGRAM_TIMEOUT,
@@ -1919,7 +1962,7 @@ mod tests {
         let (received, _rx) = mpsc::channel(8);
         let mut actor = RelayActor::new(config, received, CancellationToken::new());
         assert!(actor.active_relay_handle(forbidden.clone()).is_none());
-        assert!(actor.active_relay_handle_for_endpoint(&forbidden, &SecretKey::generate().public()).await.is_none());
+        assert!(actor.active_relay_handle_for_endpoint(&forbidden, &SecretKey::generate().public()).is_none());
         assert!(actor.active_relays.is_empty(), "unlisted URL created a relay connection actor");
         assert!(actor.active_relay_tasks.is_empty());
         assert_eq!(actor.homes(), vec![allowed]);
@@ -1931,7 +1974,6 @@ mod tests {
         secret_key: SecretKey,
         stop_token: CancellationToken,
         url: RelayUrl,
-        prio_inbox_rx: mpsc::Receiver<ActiveRelayPrioMessage>,
         inbox_rx: mpsc::Receiver<ActiveRelayMessage>,
         relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
         relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
@@ -1941,7 +1983,6 @@ mod tests {
             secret_key,
             stop_token,
             url,
-            prio_inbox_rx,
             inbox_rx,
             relay_datagrams_send,
             relay_datagrams_recv,
@@ -1956,7 +1997,6 @@ mod tests {
         secret_key: SecretKey,
         stop_token: CancellationToken,
         url: RelayUrl,
-        prio_inbox_rx: mpsc::Receiver<ActiveRelayPrioMessage>,
         inbox_rx: mpsc::Receiver<ActiveRelayMessage>,
         relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
         relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
@@ -1966,7 +2006,7 @@ mod tests {
         let opts = ActiveRelayActorOptions {
             url,
             entries: Vec::new(),
-            prio_inbox_: prio_inbox_rx,
+            endpoints_present: Default::default(),
             inbox: inbox_rx,
             relay_datagrams_send,
             relay_datagrams_recv,
@@ -1998,14 +2038,12 @@ mod tests {
         let secret_key = SecretKey::from_bytes(&[8u8; 32]);
         let (recv_datagram_tx, mut recv_datagram_rx) = mpsc::channel(16);
         let (send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
-        let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
         let (inbox_tx, inbox_rx) = mpsc::channel(16);
         let cancel_token = CancellationToken::new();
         let actor_task = start_active_relay_actor(
             secret_key.clone(),
             cancel_token.clone(),
             relay_url.clone(),
-            prio_inbox_rx,
             inbox_rx,
             send_datagram_rx,
             recv_datagram_tx,
@@ -2039,7 +2077,6 @@ mod tests {
         let supervisor_task = tokio::spawn(async move {
             let _guard = cancel_token.drop_guard();
             // move the inboxes here so it is not dropped, as this stops the actor.
-            let _prio_inbox_tx = prio_inbox_tx;
             let _inbox_tx = inbox_tx;
             tokio::select! {
                 biased;
@@ -2092,14 +2129,13 @@ mod tests {
     async fn missing_current_entry_sample_does_not_replace_it() {
         let relay: RelayUrl = "https://relay.example.com".parse().unwrap();
         let entry: RelayUrl = "https://entry.example.com".parse().unwrap();
-        let (_prio_tx, prio_inbox_) = mpsc::channel(1);
         let (_inbox_tx, inbox) = mpsc::channel(1);
         let (_send_tx, relay_datagrams_send) = mpsc::channel(1);
         let (relay_datagrams_recv, _recv_rx) = mpsc::channel(1);
         let mut actor = ActiveRelayActor::new(ActiveRelayActorOptions {
             url: relay.clone(),
             entries: vec![entry.clone()],
-            prio_inbox_,
+            endpoints_present: Default::default(),
             inbox,
             relay_datagrams_send,
             relay_datagrams_recv,
@@ -2169,14 +2205,13 @@ mod tests {
         let (peer, _echo) = start_echo_endpoint(relay.clone());
         let (recv_tx, mut recv_rx) = mpsc::channel(16);
         let (send_tx, send_rx) = mpsc::channel(16);
-        let (_prio_tx, prio_rx) = mpsc::channel(8);
         let (inbox_tx, inbox_rx) = mpsc::channel(16);
         let watch = HomeRelayWatch::default();
         watch.set(relay.clone(), RelayConnectionState::Connecting);
         let opts = ActiveRelayActorOptions {
             url: relay.clone(),
             entries: vec![entry.clone()],
-            prio_inbox_: prio_rx,
+            endpoints_present: Default::default(),
             inbox: inbox_rx,
             relay_datagrams_send: send_rx,
             relay_datagrams_recv: recv_tx,
@@ -2252,14 +2287,12 @@ mod tests {
         let secret_key = SecretKey::from_bytes(&[1u8; 32]);
         let (datagram_recv_tx, mut datagram_recv_rx) = mpsc::channel(16);
         let (send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
-        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
         let (inbox_tx, inbox_rx) = mpsc::channel(16);
         let cancel_token = CancellationToken::new();
         let task = start_active_relay_actor(
             secret_key,
             cancel_token.clone(),
             relay_url.clone(),
-            prio_inbox_rx,
             inbox_rx,
             send_datagram_rx,
             datagram_recv_tx.clone(),
@@ -2358,14 +2391,12 @@ mod tests {
         let watch = HomeRelayWatch::default();
         let (datagram_recv_tx, _datagram_recv_rx) = mpsc::channel(16);
         let (_send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
-        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
         let (inbox_tx, inbox_rx) = mpsc::channel(16);
         let cancel_token = CancellationToken::new();
         let _task = start_active_relay_actor_watched(
             secret_key.clone(),
             cancel_token.clone(),
             relay_url.clone(),
-            prio_inbox_rx,
             inbox_rx,
             send_datagram_rx,
             datagram_recv_tx,
@@ -2392,13 +2423,11 @@ mod tests {
         // Another of the same endpoint id: the relay holds the first inactive and tells it, while it is no home relay.
         let (other_recv_tx, _other_recv_rx) = mpsc::channel(16);
         let (_other_send_tx, other_send_rx) = mpsc::channel(16);
-        let (_other_prio_tx, other_prio_rx) = mpsc::channel(8);
         let (_other_inbox_tx, other_inbox_rx) = mpsc::channel(16);
         let _other = start_active_relay_actor(
             secret_key,
             cancel_token.clone(),
             relay_url.clone(),
-            other_prio_rx,
             other_inbox_rx,
             other_send_rx,
             other_recv_tx,
@@ -2441,14 +2470,12 @@ mod tests {
         let secret_key = SecretKey::from_bytes(&[1u8; 32]);
         let (datagram_recv_tx, _datagram_recv_rx) = mpsc::channel(16);
         let (_send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
-        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
         let (inbox_tx, inbox_rx) = mpsc::channel(16);
         let cancel_token = CancellationToken::new();
         let mut task = start_active_relay_actor(
             secret_key,
             cancel_token.clone(),
             relay_url,
-            prio_inbox_rx,
             inbox_rx,
             send_datagram_rx,
             datagram_recv_tx,
@@ -2613,14 +2640,12 @@ mod tests {
 
         let (datagram_recv_tx, mut datagram_recv_rx) = mpsc::channel(16);
         let (send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
-        let (_prio_inbox_tx, prio_inbox_rx) = mpsc::channel(8);
         let (_inbox_tx, inbox_rx) = mpsc::channel(16);
         let cancel_token = CancellationToken::new();
         let _task = start_active_relay_actor(
             SecretKey::from_bytes(&[5u8; 32]),
             cancel_token.clone(),
             relay_url.clone(),
-            prio_inbox_rx,
             inbox_rx,
             send_datagram_rx,
             datagram_recv_tx,
@@ -2674,6 +2699,257 @@ mod tests {
 
         cancel_token.cancel();
         Ok(())
+    }
+
+    fn test_config(relay_map: iroh_relay::RelayMap, others: Vec<RelayUrl>) -> Config {
+        Config {
+            my_relay: HomeRelayWatch::default(),
+            secret_key: SecretKey::generate(),
+            dns_resolver: DnsResolver::new(),
+            proxy_url: None,
+            relay_udp: Default::default(),
+            ipv6_reported: Arc::new(AtomicBool::new(false)),
+            tls_config: CaTlsConfig::insecure_skip_verify()
+                .client_config(default_provider())
+                .expect("infallible"),
+            metrics: Default::default(),
+            relay_map,
+            relay_allowlist: Default::default(),
+            excludes: Default::default(),
+            own: None,
+            others,
+        }
+    }
+
+    /// A handle whose actor never reads its inboxes, as one held up would not; the receivers are returned to be kept
+    /// open.
+    fn silent_handle() -> (
+        ActiveRelayHandle,
+        mpsc::Receiver<ActiveRelayMessage>,
+        mpsc::Receiver<RelaySendItem>,
+    ) {
+        let (inbox_addr, inbox_rx) = mpsc::channel(8);
+        let (datagrams_send_queue, send_rx) = mpsc::channel(8);
+        let handle = ActiveRelayHandle {
+            stop: CancellationToken::new(),
+            endpoints_present: Default::default(),
+            inbox_addr,
+            datagrams_send_queue,
+        };
+        (handle, inbox_rx, send_rx)
+    }
+
+    /// ember: with `Builder::home_on_every_relay` the first transport shares the endpoint's map, which has an inserted
+    /// relay before this actor is told of it (`RelayActorMessage::InsertRelay`); in between this transport may have
+    /// connected to it, even be home on it. Once it is another transport's relay again, this transport's connection to
+    /// it ends and its home is another, as on `remove_relay`: two connections of one endpoint id to one relay displace
+    /// each other (`SameEndpointIdConnected`).
+    #[tokio::test]
+    #[traced_test]
+    async fn inserted_relay_of_another_transport_ends_connection_and_home_here() {
+        let excluded: RelayUrl = "http://127.0.0.1:1".parse().unwrap();
+        let other: RelayUrl = "http://127.0.0.1:2".parse().unwrap();
+        let map: iroh_relay::RelayMap = [excluded.clone(), other.clone()].into_iter().collect();
+        let (received, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let mut actor = RelayActor::new(
+            test_config(map, vec![excluded.clone()]),
+            received,
+            cancel.clone(),
+        );
+        let (handle, _inbox, _send) = silent_handle();
+        let stop = handle.stop.clone();
+        actor.active_relays.insert(excluded.clone(), handle);
+        actor
+            .config
+            .my_relay
+            .set(excluded.clone(), RelayConnectionState::Connected);
+
+        let relay_config = actor.config.relay_map.get(&excluded).expect("in the map");
+        actor.insert_relay(excluded.clone(), relay_config).await;
+
+        assert!(
+            actor.config.excludes.read().unwrap().contains(&excluded),
+            "the relay is excluded again"
+        );
+        assert!(
+            !actor.active_relays.contains_key(&excluded),
+            "the excluded relay's actor is still active"
+        );
+        assert!(stop.is_cancelled(), "the excluded relay's actor was not stopped");
+        assert_eq!(
+            actor.config.my_relay.get().map(|status| status.url().clone()),
+            Some(other.clone()),
+            "home is still the excluded relay"
+        );
+        assert!(actor.active_relays.contains_key(&other), "no actor for the new home");
+        cancel.cancel();
+    }
+
+    /// Backing off before dialing again (up to 16 s) the actor still takes its messages and stops when told. Upstream
+    /// it slept through them.
+    #[tokio::test]
+    #[traced_test]
+    async fn backing_off_takes_its_inbox_and_stops() {
+        let (inbox_tx, inbox) = mpsc::channel(8);
+        let (_send_tx, relay_datagrams_send) = mpsc::channel(1);
+        let (relay_datagrams_recv, _recv_rx) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        let mut actor = ActiveRelayActor::new(ActiveRelayActorOptions {
+            url: "http://127.0.0.1:1".parse().unwrap(),
+            entries: Vec::new(),
+            endpoints_present: Default::default(),
+            inbox,
+            relay_datagrams_send,
+            relay_datagrams_recv,
+            connection_opts: RelayConnectionOptions {
+                secret_key: SecretKey::generate(),
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                prefer_ipv6: Arc::new(AtomicBool::new(false)),
+                tls_config: CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .expect("infallible"),
+                auth_token: None,
+                udp: Default::default(),
+            },
+            stop_token: stop.clone(),
+            metrics: Default::default(),
+            my_relay: Default::default(),
+        });
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let go_on = actor.sleep_backoff(Duration::from_secs(10)).await;
+            (go_on, actor)
+        }));
+
+        inbox_tx
+            .send(ActiveRelayMessage::SetHomeRelay(true))
+            .await
+            .unwrap();
+        // The inbox is read in order: once this is answered, `SetHomeRelay` was taken.
+        let (tx, rx) = oneshot::channel();
+        inbox_tx
+            .send(ActiveRelayMessage::GetLocalAddr(tx))
+            .await
+            .unwrap();
+        let local = tokio::time::timeout(Duration::from_millis(200), rx)
+            .await
+            .expect("inbox not read within 200 ms while backing off");
+        assert_eq!(local.expect("answered"), None);
+
+        stop.cancel();
+        let (go_on, actor) = tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("did not stop within 200 ms while backing off")
+            .expect("task");
+        assert!(!go_on, "stopped, the actor must exit");
+        assert!(actor.is_home_relay, "SetHomeRelay taken while backing off");
+    }
+
+    /// ember: finding the relay that reaches an endpoint reads each connection's `endpoints_present` and asks no actor,
+    /// so an actor that does not answer (backing off, closing a dead connection, its inbox full) holds up no datagram.
+    /// Upstream it asked each actor and waited for every answer, sending no datagram meanwhile.
+    #[tokio::test]
+    #[traced_test]
+    async fn route_lookup_reads_endpoints_present_and_asks_no_actor() {
+        let silent: RelayUrl = "http://127.0.0.1:1".parse().unwrap();
+        let knows: RelayUrl = "http://127.0.0.1:2".parse().unwrap();
+        let home: RelayUrl = "http://127.0.0.1:3".parse().unwrap();
+        let map: iroh_relay::RelayMap = [silent.clone(), knows.clone(), home.clone()]
+            .into_iter()
+            .collect();
+        let (received, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let mut actor = RelayActor::new(test_config(map, Vec::new()), received, cancel.clone());
+        let peer = SecretKey::generate().public();
+        // Neither actor reads its inbox; one's connection has heard from `peer`.
+        let (silent_handle_, _i1, _s1) = silent_handle();
+        let (knows_handle, _i2, _s2) = silent_handle();
+        knows_handle.endpoints_present.write().unwrap().insert(peer);
+        actor.active_relays.insert(silent.clone(), silent_handle_);
+        actor.active_relays.insert(knows.clone(), knows_handle.clone());
+
+        let found = actor
+            .active_relay_handle_for_endpoint(&home, &peer)
+            .expect("a handle");
+        assert!(
+            Arc::ptr_eq(&found.endpoints_present, &knows_handle.endpoints_present),
+            "not the relay whose connection reaches the endpoint"
+        );
+        assert!(!actor.active_relays.contains_key(&home), "dialed the remote's relay instead");
+
+        // An endpoint no connection has heard from: its own relay.
+        let other = SecretKey::generate().public();
+        let found = actor
+            .active_relay_handle_for_endpoint(&home, &other)
+            .expect("a handle");
+        assert!(actor.active_relays.contains_key(&home));
+        assert!(Arc::ptr_eq(
+            &found.endpoints_present,
+            &actor.active_relays[&home].endpoints_present
+        ));
+        cancel.cancel();
+    }
+
+    /// ember: a connection's `endpoints_present` has each endpoint a datagram came from, loses one the relay says is
+    /// gone (and takes it again from its next datagram, its last-sender shortcut reset), and is emptied as the
+    /// connection ends.
+    #[tokio::test]
+    async fn endpoints_present_follows_the_connection() {
+        let (_inbox_tx, inbox) = mpsc::channel(1);
+        let (_send_tx, relay_datagrams_send) = mpsc::channel(1);
+        let (relay_datagrams_recv, _recv_rx) = mpsc::channel(8);
+        let endpoints_present = super::EndpointsPresent::default();
+        let mut actor = ActiveRelayActor::new(ActiveRelayActorOptions {
+            url: "http://127.0.0.1:1".parse().unwrap(),
+            entries: Vec::new(),
+            endpoints_present: endpoints_present.clone(),
+            inbox,
+            relay_datagrams_send,
+            relay_datagrams_recv,
+            connection_opts: RelayConnectionOptions {
+                secret_key: SecretKey::generate(),
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                prefer_ipv6: Arc::new(AtomicBool::new(false)),
+                tls_config: CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .expect("infallible"),
+                auth_token: None,
+                udp: Default::default(),
+            },
+            stop_token: CancellationToken::new(),
+            metrics: Default::default(),
+            my_relay: Default::default(),
+        });
+        let mut state = super::ConnectedRelayState {
+            ping_tracker: PingTracker::default(),
+            last_packet_src: None,
+            pong_pending: None,
+            established: false,
+            same_endpoint_id_connected: false,
+            test_pong: None,
+        };
+        let (a, b) = (SecretKey::generate().public(), SecretKey::generate().public());
+        let datagram = |from| super::RelayToClientMsg::Datagrams {
+            remote_endpoint_id: from,
+            datagrams: Datagrams::from(b"hi"),
+        };
+        let present = || endpoints_present.read().unwrap().clone();
+        let guard = super::ClearOnDrop(endpoints_present.clone());
+
+        actor.handle_relay_msg(datagram(a), &mut state);
+        actor.handle_relay_msg(datagram(b), &mut state);
+        actor.handle_relay_msg(datagram(b), &mut state);
+        assert_eq!(present(), [a, b].into_iter().collect());
+
+        actor.handle_relay_msg(super::RelayToClientMsg::EndpointGone(b), &mut state);
+        assert_eq!(present(), [a].into_iter().collect());
+        actor.handle_relay_msg(datagram(b), &mut state);
+        assert_eq!(present(), [a, b].into_iter().collect(), "b back with its next datagram");
+
+        drop(guard);
+        assert!(present().is_empty(), "the connection ended");
     }
 
     #[tokio::test]

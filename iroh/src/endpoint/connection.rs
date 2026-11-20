@@ -1652,12 +1652,23 @@ mod tests {
             while paths_client.next().await.is_some() {}
         })
         .await
-        .expect("client paths watcher did not close within 1s of connection close");
+        .expect("client paths watcher did not close immediately after connection close");
+
+        // ember: the peer's CONNECTION_CLOSE arrives over real sockets. With time paused,
+        // auto-advance can expire the watcher deadline before that I/O is ready. Wait for
+        // the peer close on the real clock, then test only the local watcher's shutdown.
+        tokio::time::resume();
+        let reason = tokio::time::timeout(Duration::from_secs(1), conn_server.closed())
+            .await
+            .expect("server did not receive connection close within 1s");
+        assert!(matches!(reason, super::ConnectionError::ApplicationClosed(_)));
+        tokio::time::pause();
+
         tokio::time::timeout(Duration::from_nanos(1), async {
             while paths_server.next().await.is_some() {}
         })
         .await
-        .expect("server paths watcher did not close within 1s of connection close");
+        .expect("server paths watcher did not close immediately after connection close");
 
         server.close().await;
         client.close().await;

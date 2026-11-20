@@ -493,6 +493,24 @@ impl RemoteStateActor {
             RemoteStateMessage::RelayConnected(url) => {
                 self.handle_relay_connected(url);
             }
+            #[cfg(test)]
+            RemoteStateMessage::RelayLossStats(conn_stable_id, url, tx) => {
+                let stats = self.connections.get(&ConnId(conn_stable_id)).map(|conn_state| {
+                    let opening = conn_state
+                        .relay_opening
+                        .values()
+                        .filter(|a| matches!(a, transports::Addr::Relay(u, _) if u == &url))
+                        .count();
+                    let lost = conn_state
+                        .relay_lost
+                        .iter()
+                        .filter(|(a, _)| matches!(a, transports::Addr::Relay(u, _) if u == &url))
+                        .map(|(_, &n)| n)
+                        .sum();
+                    (opening, lost, conn_state.relay_lost_total)
+                });
+                tx.send(stats).ok();
+            }
         }
     }
 
@@ -2055,6 +2073,10 @@ pub(crate) enum RemoteStateMessage {
     /// ember: an inserted local relay connected (`Endpoint::insert_relay`): reopen missing paths.
     #[debug("RelayConnected({_0})")]
     RelayConnected(RelayUrl),
+    /// ember: returns `(opening_for_relay, lost_for_relay, relay_lost_total)` for a connection on this remote (tests).
+    #[cfg(test)]
+    #[debug("RelayLossStats({_0}, {_1})")]
+    RelayLossStats(usize, RelayUrl, oneshot::Sender<Option<(usize, u32, u32)>>),
 }
 
 /// Information about a holepunch attempt.

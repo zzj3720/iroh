@@ -182,6 +182,8 @@ struct ActiveRelayActor {
     /// The home relay server needs to maintain it's connection to the relay server, even if
     /// the relay actor is otherwise idle.
     is_home_relay: bool,
+    /// Deadline corresponding to [`Self::inactive_timeout`], extended only by real outgoing datagrams.
+    inactive_deadline: Instant,
     /// When this expires the actor has been idle and should shut down.
     ///
     /// Unless it is managing the home relay connection.  Inactivity is only tracked on the
@@ -337,6 +339,7 @@ impl ActiveRelayActor {
         let udp = connection_opts.udp.clone();
         let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts.clone());
         let (probe_now_tx, _probe_now_rx) = watch::channel(0u64);
+        let inactive_deadline = Instant::now() + RELAY_INACTIVE_CLEANUP_TIME;
         ActiveRelayActor {
             endpoints_present,
             inbox,
@@ -357,7 +360,8 @@ impl ActiveRelayActor {
             _entry_probes: None,
             udp,
             is_home_relay: false,
-            inactive_timeout: Box::pin(time::sleep(RELAY_INACTIVE_CLEANUP_TIME)),
+            inactive_deadline,
+            inactive_timeout: Box::pin(time::sleep_until(inactive_deadline)),
             stop_token,
             metrics,
             my_relay,
@@ -656,6 +660,9 @@ impl ActiveRelayActor {
     /// through it (up to 16 s): it neither stopped nor took a message meanwhile. Returns `false` if the actor is to
     /// exit.
     async fn sleep_backoff(&mut self, delay: Duration) -> bool {
+        let mut send_datagram_flush = time::interval(UNDELIVERABLE_DATAGRAM_TIMEOUT);
+        send_datagram_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        send_datagram_flush.reset();
         let sleep = time::sleep(delay);
         tokio::pin!(sleep);
         loop {
@@ -664,6 +671,12 @@ impl ActiveRelayActor {
                 _ = self.stop_token.cancelled() => {
                     debug!("Shutdown.");
                     return false;
+                }
+                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
+                    if !self.flush_undeliverable_datagrams(false) {
+                        debug!(?RELAY_INACTIVE_CLEANUP_TIME, "Inactive while backing off, exiting.");
+                        return false;
+                    }
                 }
                 msg = self.inbox.recv() => {
                     let Some(msg) = msg else {
@@ -699,6 +712,9 @@ impl ActiveRelayActor {
                             drop(sender);
                         }
                     }
+                }
+                _ = send_datagram_flush.tick() => {
+                    self.flush_undeliverable_datagrams(true);
                 }
                 _ = &mut sleep => return true,
             }
@@ -745,9 +761,40 @@ impl ActiveRelayActor {
     }
 
     fn reset_inactive_timeout(&mut self) {
-        self.inactive_timeout
-            .as_mut()
-            .reset(Instant::now() + RELAY_INACTIVE_CLEANUP_TIME);
+        self.extend_inactive_timeout(Instant::now());
+    }
+
+    fn extend_inactive_timeout(&mut self, active_at: Instant) {
+        let deadline = active_at + RELAY_INACTIVE_CLEANUP_TIME;
+        if deadline > self.inactive_deadline {
+            self.inactive_deadline = deadline;
+            self.inactive_timeout.as_mut().reset(deadline);
+        }
+    }
+
+    /// ember: drains queued outgoing datagrams that cannot be delivered while disconnected, extending
+    /// `inactive_timeout` only when datagrams were actually queued to send. Returns `true` if the actor is still
+    /// within its active window (or is a home relay), or `false` if its non-home inactivity deadline has elapsed with
+    /// nothing new queued.
+    fn flush_undeliverable_datagrams(&mut self, log_drop: bool) -> bool {
+        let now = Instant::now();
+        let mut latest_active: Option<Instant> = None;
+        let mut dropped = false;
+        while let Ok(item) = self.relay_datagrams_send.try_recv() {
+            dropped = true;
+            let active_at = item.queued.unwrap_or(now);
+            latest_active = Some(match latest_active {
+                Some(prev) => prev.max(active_at),
+                None => active_at,
+            });
+        }
+        if dropped && log_drop {
+            debug!(?UNDELIVERABLE_DATAGRAM_TIMEOUT, "Dropping datagrams to send.");
+        }
+        if let Some(active_at) = latest_active {
+            self.extend_inactive_timeout(active_at);
+        }
+        self.is_home_relay || Instant::now() < self.inactive_deadline
     }
 
     fn set_home_relay(&mut self, is_home: bool) {
@@ -787,6 +834,12 @@ impl ActiveRelayActor {
                 _ = self.stop_token.cancelled() => {
                     debug!("Shutdown.");
                     break None;
+                }
+                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
+                    if !self.flush_undeliverable_datagrams(false) {
+                        debug!(?RELAY_INACTIVE_CLEANUP_TIME, "Inactive, exiting.");
+                        break None;
+                    }
                 }
                 res = &mut dialing_fut => {
                     match res {
@@ -835,18 +888,7 @@ impl ActiveRelayActor {
                     }
                 }
                 _ = send_datagram_flush.tick() => {
-                    self.reset_inactive_timeout();
-                    let mut logged = false;
-                    while self.relay_datagrams_send.try_recv().is_ok() {
-                        if !logged {
-                            debug!(?UNDELIVERABLE_DATAGRAM_TIMEOUT, "Dropping datagrams to send.");
-                            logged = true;
-                        }
-                    }
-                }
-                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
-                    debug!(?RELAY_INACTIVE_CLEANUP_TIME, "Inactive, exiting.");
-                    break None;
+                    self.flush_undeliverable_datagrams(true);
                 }
             }
         }
@@ -1312,6 +1354,8 @@ pub(super) enum RelayActorMessage {
     /// Sent after a major network change to detect broken connections faster
     /// using RTT-based timeouts instead of the default 5s ping timeout.
     CheckConnectionAfterNetworkChange,
+    #[cfg(test)]
+    HasActiveRelay(RelayUrl, oneshot::Sender<bool>),
 }
 
 #[derive(Debug, Clone)]
@@ -1371,6 +1415,9 @@ pub(crate) struct Config {
     /// ember: the relays the other transports were bound to be home on (the first transport's): inserted again after
     /// they were removed, they are excluded here again.
     pub others: Vec<RelayUrl>,
+    /// ember: whether the endpoint was built with `Builder::home_on_every_relay`, so each relay path dials its own URL
+    /// rather than borrowing another relay's connection via `endpoints_present`.
+    pub home_on_every_relay: bool,
 }
 
 /// ember: the relays a relay transport is not home on (`Config::excludes`), as its actor and its sender share them.
@@ -1636,6 +1683,14 @@ impl RelayActor {
                 let connecting_home = self.insert_relay(url, config).await;
                 done.send(connecting_home).ok();
             }
+            #[cfg(test)]
+            RelayActorMessage::HasActiveRelay(url, done) => {
+                let active = self
+                    .active_relays
+                    .get(&url)
+                    .is_some_and(|handle| !handle.inbox_addr.is_closed());
+                done.send(active).ok();
+            }
         }
     }
 
@@ -1826,6 +1881,13 @@ impl RelayActor {
         }
         if let Some(handle) = self.active_relays.get(url) {
             return Some(handle.clone());
+        }
+        // ember: on `Builder::home_on_every_relay`, each multipath relay path names its own relay; sending `url`'s
+        // packets through another relay's connection opens a path named `url` whose RTT, per-remote policy, and
+        // lifecycle belong to the other relay. Dial `url` itself so a reachable extra relay opens genuinely and an
+        // unreachable one never opens a misnamed path.
+        if self.config.home_on_every_relay {
+            return self.active_relay_handle(url.clone());
         }
 
         // If we don't have an open connection to the remote endpoint's home relay, see if
@@ -2078,7 +2140,7 @@ mod tests {
             metrics: Default::default(), relay_map: original,
             relay_allowlist: allowlist.clone(),
             relay_policies: crate::socket::relay_policy::RelayPolicies::with_allowlist(allowlist),
-            excludes: Default::default(), own: None, others: vec![],
+            excludes: Default::default(), own: None, others: vec![], home_on_every_relay: false,
         };
         let (received, _rx) = mpsc::channel(8);
         let mut actor = RelayActor::new(config, received, CancellationToken::new());
@@ -2705,6 +2767,7 @@ mod tests {
             excludes: Default::default(),
             own: None,
             others: Vec::new(),
+            home_on_every_relay: false,
         };
         let (recv_tx, mut recv_rx) = mpsc::channel(RELAY_DATAGRAM_QUEUE);
         // Room for all this test sends: it never waits on the actor.
@@ -2847,6 +2910,7 @@ mod tests {
             excludes: Default::default(),
             own: None,
             others,
+            home_on_every_relay: false,
         }
     }
 
@@ -2989,7 +3053,7 @@ mod tests {
             .collect();
         let (received, _rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
-        let mut actor = RelayActor::new(test_config(map, Vec::new()), received, cancel.clone());
+        let mut actor = RelayActor::new(test_config(map.clone(), Vec::new()), received, cancel.clone());
         let peer = SecretKey::generate().public();
         // Neither actor reads its inbox; one's connection has heard from `peer`.
         let (silent_handle_, _i1, _s1) = silent_handle();
@@ -3017,6 +3081,26 @@ mod tests {
             &found.endpoints_present,
             &actor.active_relays[&home].endpoints_present
         ));
+
+        // On `Builder::home_on_every_relay`, `home` is never aliased onto `knows` even when `knows` has heard from `peer`.
+        let cancel_multi = CancellationToken::new();
+        let mut multi_cfg = test_config(map, Vec::new());
+        multi_cfg.home_on_every_relay = true;
+        let (received_multi, _rx_multi) = mpsc::channel(8);
+        let mut multi_actor = RelayActor::new(multi_cfg, received_multi, cancel_multi.clone());
+        multi_actor.active_relays.insert(knows.clone(), knows_handle.clone());
+        let found_multi = multi_actor
+            .active_relay_handle_for_endpoint(&home, &peer)
+            .expect("a handle for home");
+        assert!(
+            multi_actor.active_relays.contains_key(&home),
+            "home_on_every_relay must dial the addressed relay rather than borrowing another"
+        );
+        assert!(!Arc::ptr_eq(
+            &found_multi.endpoints_present,
+            &knows_handle.endpoints_present
+        ));
+        cancel_multi.cancel();
         cancel.cancel();
     }
 
@@ -3947,5 +4031,224 @@ mod tests {
         actor.has_compared = false;
         assert_eq!(step(&mut actor, 30_000, 20_000), (Some(entry), Duration::from_secs(30)));
         assert_eq!(actor.candidate, None);
+    }
+
+    /// ember: on `Builder::home_on_every_relay`, an extra non-home relay whose handshake stays pending across 10 s
+    /// `CONNECT_TIMEOUT` failures and reconnect backoffs must exit and be reaped after `RELAY_INACTIVE_CLEANUP_TIME`
+    /// (60 s) once no new datagrams are queued (empty 3 s undeliverable flushes must not push its idle deadline back),
+    /// while an established extra non-home relay carrying periodic outgoing datagrams remains active until idle.
+    #[tokio::test]
+    #[traced_test]
+    async fn non_home_blackhole_relay_exits_after_inactive_cleanup_time() -> Result {
+        use std::sync::atomic::Ordering;
+
+        use n0_future::time::Instant;
+
+        use super::RelayActorMessage;
+
+        let (home_map, home_url, _home_server) = test_utils::run_relay_server().await?;
+        let (_extra_map, extra_url, _extra_server) = test_utils::run_relay_server().await?;
+        let (peer_home, _echo_home) = start_echo_endpoint(home_url.clone());
+        let (peer_extra, _echo_extra) = start_echo_endpoint(extra_url.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .std_context("bind blackhole relay")?;
+        let blackhole_url: RelayUrl = format!(
+            "https://{}",
+            listener.local_addr().std_context("blackhole addr")?
+        )
+        .parse()
+        .std_context("blackhole relay url")?;
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_notify = Arc::new(tokio::sync::Notify::new());
+        let _blackhole = {
+            let accepted = accepted.clone();
+            let accepted_notify = accepted_notify.clone();
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    accepted_notify.notify_waiters();
+                }
+            }))
+        };
+
+        let mut cfg = test_config(home_map, Vec::new());
+        cfg.home_on_every_relay = true;
+        let (recv_tx, mut recv_rx) = mpsc::channel(RELAY_DATAGRAM_QUEUE);
+        let (send_tx, send_rx) = mpsc::channel(RELAY_DATAGRAM_QUEUE);
+        let (msg_tx, msg_rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let actor = RelayActor::new(cfg, recv_tx, cancel.clone());
+        let _actor = AbortOnDropHandle::new(tokio::spawn(
+            actor.run(msg_rx, send_rx).instrument(info_span!("relay-actor")),
+        ));
+
+        let has_active = |url: &RelayUrl| {
+            let msg_tx = msg_tx.clone();
+            let url = url.clone();
+            async move {
+                let (tx, rx) = oneshot::channel();
+                msg_tx
+                    .send(RelayActorMessage::HasActiveRelay(url, tx))
+                    .await
+                    .std_context("query HasActiveRelay")?;
+                rx.await.std_context("recv HasActiveRelay")
+            }
+        };
+
+        // Warm `home_url` so `peer_home` is in `home_url`'s `endpoints_present`: `home_on_every_relay` must still dial
+        // `blackhole_url` directly instead of borrowing `home_url`.
+        send_recv_echo(
+            RelaySendItem {
+                remote_endpoint: peer_home,
+                url: home_url.clone(),
+                datagrams: Datagrams::from(b"warm-home"),
+                queued: Some(Instant::now()),
+            },
+            &send_tx,
+            &mut recv_rx,
+        )
+        .await?;
+        while tokio::time::timeout(Duration::from_millis(50), recv_rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        // Establish a live non-home extra relay (`extra_url`) and trigger one dial to `blackhole_url` at t = 0s.
+        let extra_echo = |tag: &'static [u8]| RelaySendItem {
+            remote_endpoint: peer_extra,
+            url: extra_url.clone(),
+            datagrams: Datagrams::from(tag),
+            queued: Some(Instant::now()),
+        };
+        send_recv_echo(extra_echo(b"extra-0"), &send_tx, &mut recv_rx).await?;
+
+        send_tx
+            .send(RelaySendItem {
+                remote_endpoint: peer_home,
+                url: blackhole_url.clone(),
+                datagrams: Datagrams::from(b"blackhole-once"),
+                queued: Some(Instant::now()),
+            })
+            .await
+            .std_context("send to blackhole")?;
+
+        wait_for_cond(
+            &accepted_notify,
+            || accepted.load(Ordering::SeqCst) == 1,
+            "initial blackhole dial",
+        )
+        .await?;
+        assert!(has_active(&blackhole_url).await?, "blackhole actor active at t=0s");
+        assert!(has_active(&extra_url).await?, "extra actor active at t=0s");
+
+        // Step through empty 3 s flushes (`t=4s`, `t=8s`) and multiple 10 s `CONNECT_TIMEOUT` failures + backoffs up
+        // to `t=45s`, keeping `extra_url` active with outgoing traffic at `t=20s` and `t=40s`.
+        EntryProbeRig::advance_clock(Duration::from_secs(4)).await;
+        EntryProbeRig::advance_clock(Duration::from_secs(4)).await;
+        EntryProbeRig::advance_clock(Duration::from_secs(4)).await;
+        wait_for_cond(
+            &accepted_notify,
+            || accepted.load(Ordering::SeqCst) >= 2,
+            "second blackhole dial after first 10s timeout",
+        )
+        .await?;
+
+        EntryProbeRig::advance_clock(Duration::from_secs(8)).await;
+        send_recv_echo(extra_echo(b"extra-20"), &send_tx, &mut recv_rx).await?;
+
+        EntryProbeRig::advance_clock(Duration::from_secs(3)).await;
+        wait_for_cond(
+            &accepted_notify,
+            || accepted.load(Ordering::SeqCst) >= 3,
+            "third blackhole dial",
+        )
+        .await?;
+
+        EntryProbeRig::advance_clock(Duration::from_secs(11)).await;
+        wait_for_cond(
+            &accepted_notify,
+            || accepted.load(Ordering::SeqCst) >= 4,
+            "fourth blackhole dial",
+        )
+        .await?;
+
+        EntryProbeRig::advance_clock(Duration::from_secs(6)).await;
+        send_recv_echo(extra_echo(b"extra-40"), &send_tx, &mut recv_rx).await?;
+
+        EntryProbeRig::advance_clock(Duration::from_secs(5)).await;
+        wait_for_cond(
+            &accepted_notify,
+            || accepted.load(Ordering::SeqCst) >= 5,
+            "fifth blackhole dial at t=45s",
+        )
+        .await?;
+        assert!(
+            has_active(&blackhole_url).await?,
+            "blackhole actor must remain active before RELAY_INACTIVE_CLEANUP_TIME"
+        );
+
+        // Advance +17 s (`t=62s > 60s`): `blackhole_url` had no new datagrams since `t=0s` and must exit and be reaped,
+        // while `extra_url` (active at `t=40s`) stays connected.
+        EntryProbeRig::advance_clock(Duration::from_secs(9)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        EntryProbeRig::advance_clock(Duration::from_secs(8)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while has_active(&blackhole_url).await.unwrap_or(true) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("blackhole non-home actor must exit and be reaped by t=62s")?;
+
+        let accepted_at_exit = accepted.load(Ordering::SeqCst);
+        assert!(
+            has_active(&extra_url).await?,
+            "connected extra relay with traffic at t=40s must still be active at t=62s"
+        );
+        send_recv_echo(extra_echo(b"extra-62"), &send_tx, &mut recv_rx).await?;
+
+        // Step another 40 s (`t=102s`, well past the initial 60 s): `extra_url` is still alive and echoing, while
+        // `blackhole_url` makes zero further dial attempts.
+        for _ in 0..4 {
+            EntryProbeRig::advance_clock(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            accepted_at_exit,
+            "exited blackhole relay must not dial again after cleanup"
+        );
+        assert!(
+            has_active(&extra_url).await?,
+            "extra relay refreshed at t=62s must stay active at t=102s"
+        );
+        send_recv_echo(extra_echo(b"extra-102"), &send_tx, &mut recv_rx).await?;
+
+        // Stop sending to `extra_url` and advance 65 s (`t=167s`): `extra_url` also exits on inactivity, and
+        // `blackhole_url` still has zero new dials across 105 s after exit.
+        for _ in 0..6 {
+            EntryProbeRig::advance_clock(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        EntryProbeRig::advance_clock(Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while has_active(&extra_url).await.unwrap_or(true) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("idle extra non-home relay must exit after 60s without outgoing datagrams")?;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            accepted_at_exit,
+            "blackhole relay must perform zero dials across 105s after exit"
+        );
+
+        cancel.cancel();
+        Ok(())
     }
 }

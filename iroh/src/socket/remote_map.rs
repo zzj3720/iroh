@@ -331,14 +331,61 @@ impl RemoteMap {
     }
 
     /// ember: has `remote`'s actor go by its disabled relays now (`Endpoint::set_disabled_relays`), `done` told once it
-    /// did: none of its addresses, paths or paths being opened through a disabled relay are left. A
-    /// remote with no actor running has nothing to give up (one started later goes by the policy from its start).
+    /// did: none of its active paths or paths being opened through a disabled relay are left, and any newly re-allowed
+    /// shelved relays start reopening. A remote with no actor running has nothing to update.
     pub(super) async fn apply_relay_policy(&mut self, remote: EndpointId, done: oneshot::Sender<()>) {
         if self.senders.read_only().get(&remote).is_none() {
             done.send(()).ok();
             return;
         }
-        self.send_to_actor(remote, RemoteStateMessage::ApplyRelayPolicy(done)).await;
+        let (tx, rx) = oneshot::channel();
+        self.send_to_actor(remote, RemoteStateMessage::ApplyRelayPolicy(tx))
+            .await;
+        self.wait_ack(rx).await;
+        done.send(()).ok();
+    }
+
+    /// ember: notifies every running `RemoteStateActor` that `url` was locally removed (`Endpoint::remove_relay`),
+    /// waiting until each has closed any open or opening paths through `url`.
+    pub(super) async fn on_relay_removed(&mut self, url: &RelayUrl) {
+        let remotes: Vec<EndpointId> = {
+            let read = self.senders.read_only();
+            let guard = read.guard();
+            read.keys(&guard).copied().collect()
+        };
+        let mut acks = Vec::with_capacity(remotes.len());
+        for remote in remotes {
+            let (tx, rx) = oneshot::channel();
+            self.send_to_actor(remote, RemoteStateMessage::RelayRemoved(url.clone(), tx))
+                .await;
+            acks.push(rx);
+        }
+        for rx in acks {
+            self.wait_ack(rx).await;
+        }
+    }
+
+    /// ember: notifies every running `RemoteStateActor` that local relay `url` is connected and usable again.
+    pub(super) async fn on_relay_connected(&mut self, url: &RelayUrl) {
+        let remotes: Vec<EndpointId> = {
+            let read = self.senders.read_only();
+            let guard = read.guard();
+            read.keys(&guard).copied().collect()
+        };
+        for remote in remotes {
+            self.send_to_actor(remote, RemoteStateMessage::RelayConnected(url.clone()))
+                .await;
+        }
+    }
+
+    async fn wait_ack(&mut self, rx: oneshot::Receiver<()>) {
+        tokio::pin!(rx);
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                _ = self.cleanup() => {}
+            }
+        }
     }
 
     pub(super) fn senders(&self) -> ReadOnlyMap<EndpointId, mpsc::Sender<RemoteStateMessage>> {

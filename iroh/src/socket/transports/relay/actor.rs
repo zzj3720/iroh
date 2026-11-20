@@ -1302,10 +1302,11 @@ pub(super) enum RelayActorMessage {
     },
     /// ember: the relay removed from the endpoint (`Endpoint::remove_relay`): out of this actor's map and its excludes,
     /// its connection to it ended at once, and its home chosen again where it was that relay.
-    RemoveRelay(RelayUrl),
+    RemoveRelay(RelayUrl, oneshot::Sender<()>),
     /// ember: a relay inserted into the endpoint (`Endpoint::insert_relay`): the one this actor was bound to be home on
-    /// is its again (or another transport's excluded again), and an actor with no home takes it as its home.
-    InsertRelay(RelayUrl, Arc<RelayConfig>),
+    /// is its again (or another transport's excluded again), and an actor with no home takes it as its home. Replies
+    /// `true` if this actor is now connecting to `RelayUrl` as its home relay.
+    InsertRelay(RelayUrl, Arc<RelayConfig>, oneshot::Sender<bool>),
     /// Trigger an immediate health check on all relay connections.
     ///
     /// Sent after a major network change to detect broken connections faster
@@ -1358,6 +1359,7 @@ pub(crate) struct Config {
     /// look up the auth token and any future per-relay options.
     pub relay_map: RelayMap,
     pub relay_allowlist: crate::socket::relay_policy::RelayAllowlist,
+    pub relay_policies: crate::socket::relay_policy::RelayPolicies,
     /// ember: relays of `relay_map` this actor is not home on, another relay transport's
     /// (`Builder::home_on_every_relay`: the first transport has the endpoint's whole map, relays inserted later with it,
     /// the others one relay each). Shared with the transport's sender (`RelaySender::owns`): a relay removed from the
@@ -1626,11 +1628,13 @@ impl RelayActor {
             RelayActorMessage::CheckConnectionAfterNetworkChange => {
                 self.check_connection_after_network_change().await;
             }
-            RelayActorMessage::RemoveRelay(url) => {
+            RelayActorMessage::RemoveRelay(url, done) => {
                 self.remove_relay(url).await;
+                done.send(()).ok();
             }
-            RelayActorMessage::InsertRelay(url, config) => {
-                self.insert_relay(url, config).await;
+            RelayActorMessage::InsertRelay(url, config, done) => {
+                let connecting_home = self.insert_relay(url, config).await;
+                done.send(connecting_home).ok();
             }
         }
     }
@@ -1670,8 +1674,8 @@ impl RelayActor {
 
     /// ember: `url` inserted into the endpoint (its map has it already, the first transport's being the endpoint's):
     /// the relay this actor was bound to be home on is its again, one another transport was is excluded again, and an
-    /// actor home on none takes one it may be home on.
-    async fn insert_relay(&mut self, url: RelayUrl, config: Arc<RelayConfig>) {
+    /// actor home on none takes one it may be home on. Returns `true` if `url` is now this actor's connecting home.
+    async fn insert_relay(&mut self, url: RelayUrl, config: Arc<RelayConfig>) -> bool {
         if self.config.own.as_ref() == Some(&url) {
             self.config.relay_map.insert(url.clone(), config);
         } else if self.config.others.contains(&url) {
@@ -1709,6 +1713,10 @@ impl RelayActor {
                 .set(home.clone(), RelayConnectionState::Connecting);
             self.set_home_relay(home).await;
         }
+        self.config
+            .my_relay
+            .get()
+            .is_some_and(|status| status.url() == &url && !status.is_connected())
     }
 
     /// Sends datagrams to the correct [`ActiveRelayActor`].
@@ -1811,7 +1819,11 @@ impl RelayActor {
         url: &RelayUrl,
         remote_endpoint: &EndpointId,
     ) -> Option<ActiveRelayHandle> {
-        if !self.config.relay_allowlist.allows(url) { return None; }
+        if !self.config.relay_allowlist.allows(url)
+            || !self.config.relay_policies.usable(remote_endpoint, url)
+        {
+            return None;
+        }
         if let Some(handle) = self.active_relays.get(url) {
             return Some(handle.clone());
         }
@@ -1823,12 +1835,13 @@ impl RelayActor {
         let found_relay = self
             .active_relays
             .iter()
-            .find(|(_, handle)| {
-                handle
-                    .endpoints_present
-                    .read()
-                    .expect("poisoned")
-                    .contains(remote_endpoint)
+            .find(|(candidate, handle)| {
+                self.config.relay_policies.usable(remote_endpoint, candidate)
+                    && handle
+                        .endpoints_present
+                        .read()
+                        .expect("poisoned")
+                        .contains(remote_endpoint)
             })
             .map(|(url, _)| url.clone());
         let url = found_relay.unwrap_or(url.clone());
@@ -2063,7 +2076,9 @@ mod tests {
             ipv6_reported: Arc::new(AtomicBool::new(false)),
             tls_config: CaTlsConfig::insecure_skip_verify().client_config(default_provider()).unwrap(),
             metrics: Default::default(), relay_map: original,
-            relay_allowlist: allowlist, excludes: Default::default(), own: None, others: vec![],
+            relay_allowlist: allowlist.clone(),
+            relay_policies: crate::socket::relay_policy::RelayPolicies::with_allowlist(allowlist),
+            excludes: Default::default(), own: None, others: vec![],
         };
         let (received, _rx) = mpsc::channel(8);
         let mut actor = RelayActor::new(config, received, CancellationToken::new());
@@ -2686,6 +2701,7 @@ mod tests {
             metrics: Default::default(),
             relay_map,
             relay_allowlist: Default::default(),
+            relay_policies: Default::default(),
             excludes: Default::default(),
             own: None,
             others: Vec::new(),
@@ -2827,6 +2843,7 @@ mod tests {
             metrics: Default::default(),
             relay_map,
             relay_allowlist: Default::default(),
+            relay_policies: Default::default(),
             excludes: Default::default(),
             own: None,
             others,
@@ -3900,24 +3917,35 @@ mod tests {
             (chosen, delay_rx.try_recv().unwrap())
         };
 
+        // Exact 20% boundary (`50 ms -> 40 ms`: 10 ms == `ENTRY_MIN_GAIN`, `40 * 5 == 50 * 4`) is rejected even on the
+        // very first comparison (`!has_compared`), because strictly better than 20% is required.
+        assert_eq!(step(&mut actor, 50_000, 40_000), (None, Duration::from_secs(30)));
+        assert_eq!(actor.candidate, None);
+
         // Sub-ms loopback noise (500us vs 200us: 60% faster, 0.3ms < 10ms) and 30ms vs 22ms (26.7% faster, 8ms < 10ms)
         // never create a candidate and back off all the way to 300s.
-        assert_eq!(step(&mut actor, 500, 200), (None, Duration::from_secs(30)));
+        assert_eq!(step(&mut actor, 500, 200), (None, Duration::from_secs(60)));
         assert_eq!(actor.candidate, None);
-        assert_eq!(step(&mut actor, 30_000, 22_000), (None, Duration::from_secs(60)));
+        assert_eq!(step(&mut actor, 30_000, 22_000), (None, Duration::from_secs(120)));
         assert_eq!(actor.candidate, None);
         // 60ms vs 49ms: 11ms >= 10ms, but < 20% faster (`49 * 5 >= 60 * 4`), still no candidate.
-        assert_eq!(step(&mut actor, 60_000, 49_000), (None, Duration::from_secs(120)));
+        assert_eq!(step(&mut actor, 60_000, 49_000), (None, Duration::from_secs(240)));
         assert_eq!(actor.candidate, None);
-        assert_eq!(step(&mut actor, 400, 150), (None, Duration::from_secs(240)));
-        assert_eq!(step(&mut actor, 30_000, 21_000), (None, Duration::from_secs(300)));
+        // 1us short of 10ms (`30_000us -> 20_001us`: 9.999ms < 10ms) stays rejected at 300s cap.
+        assert_eq!(step(&mut actor, 30_000, 20_001), (None, Duration::from_secs(300)));
         assert_eq!(step(&mut actor, 30_000, 21_000), (None, Duration::from_secs(300)));
 
-        // Both satisfied (30ms vs 19ms: 11ms >= 10ms and >20% faster): candidate on round 1 resets sleep to 30s,
-        // round 2 confirms switch.
-        assert_eq!(step(&mut actor, 30_000, 19_000), (None, Duration::from_secs(30)));
+        // Exact 10ms boundary (`30 ms -> 20 ms`: 10 ms == `ENTRY_MIN_GAIN` and `20 * 5 < 30 * 4`) passes: subsequent
+        // comparison records candidate on round 1 (resetting sleep to 30s) and confirms switch on round 2.
+        assert_eq!(step(&mut actor, 30_000, 20_000), (None, Duration::from_secs(30)));
         assert_eq!(actor.candidate, Some((entry.clone(), 1)));
-        assert_eq!(step(&mut actor, 30_000, 19_000), (Some(entry), Duration::from_secs(30)));
+        assert_eq!(step(&mut actor, 30_000, 20_000), (Some(entry.clone()), Duration::from_secs(30)));
+        assert_eq!(actor.candidate, None);
+
+        // First comparison after `has_compared = false` (startup / `update_entries`) at exact 10ms boundary
+        // (`30 ms -> 20 ms`) switches immediately on round 1.
+        actor.has_compared = false;
+        assert_eq!(step(&mut actor, 30_000, 20_000), (Some(entry), Duration::from_secs(30)));
         assert_eq!(actor.candidate, None);
     }
 }

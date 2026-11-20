@@ -3719,6 +3719,1169 @@ mod tests {
         Ok(())
     }
 
+    /// ember: clearing a remote's disabled relay (`Endpoint::set_disabled_relays`) restores the shelved relay address
+    /// and reopens a path through it on existing client connections within 3 s without redialing or address lookup,
+    /// across five disable/enable cycles without exhausting `relay_lost`.
+    #[tokio::test]
+    #[traced_test]
+    async fn remote_relay_policy_cleared_reopens_path_repeatedly() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .default_path_max_idle_timeout(Duration::from_secs(3))
+                            .build(),
+                    )
+                    .clear_ip_transports()
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(41).await?;
+        let client = bind(40).await?;
+        let echo = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = echo.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let got = recv.read_to_end(64).await.unwrap_or_default();
+                        send.write_all(&got).await.ok();
+                        send.finish().ok();
+                    }
+                });
+            }
+        });
+        let addr = time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server.addr();
+                let urls: Vec<_> = addr.relay_urls().cloned().collect();
+                if urls.contains(&url_a) && urls.contains(&url_b) {
+                    return addr;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        let echoes = async |conn: &Connection| -> Result {
+            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+            send.write_all(b"still there").await.anyerr()?;
+            send.finish().anyerr()?;
+            assert_eq!(recv.read_to_end(64).await.anyerr()?, b"still there");
+            Ok(())
+        };
+        let through = |conn: &Connection, url: &RelayUrl| {
+            conn.paths()
+                .iter()
+                .any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()))
+        };
+        let until = async |limit: Duration, what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+            time::timeout(limit, async {
+                while !cond() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| n0_error::anyerr!("{what}: not in {limit:?}"))
+        };
+
+        let remote = server.id();
+        let conn = client.connect(addr, TEST_ALPN).await?;
+        echoes(&conn).await?;
+        until(
+            Duration::from_secs(10),
+            "both relay paths initially established",
+            Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+
+        let mut reopen_times = Vec::new();
+        for round in 1..=5 {
+            client
+                .set_disabled_relays(remote, [url_a.clone()].into())
+                .await;
+            let a_before = client.relay_datagrams(&url_a, &remote);
+            let b_before = client.relay_datagrams(&url_b, &remote);
+            until(
+                Duration::from_secs(3),
+                "path through a closed on disable",
+                Box::new(|| !through(&conn, &url_a) && through(&conn, &url_b)),
+            )
+            .await?;
+            until(
+                Duration::from_secs(5),
+                "b kept alive while a is disabled",
+                Box::new(|| client.relay_datagrams(&url_b, &remote).sent >= b_before.sent + 5),
+            )
+            .await?;
+            echoes(&conn).await?;
+            assert_eq!(
+                client.relay_datagrams(&url_a, &remote).sent,
+                a_before.sent,
+                "round {round}: datagrams handed to a while disabled"
+            );
+            assert!(conn.close_reason().is_none(), "round {round}: connection stayed open");
+
+            let cleared_at = time::Instant::now();
+            client.set_disabled_relays(remote, Default::default()).await;
+            until(
+                Duration::from_secs(3),
+                "path through a reopened after clearing disabled relays",
+                Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+            )
+            .await?;
+            let reopened_in = cleared_at.elapsed();
+            reopen_times.push(reopened_in);
+            info!(round, ?reopened_in, "reopened path through a");
+            assert!(
+                reopened_in <= Duration::from_secs(3),
+                "round {round}: path reopen took {reopened_in:?} (> 3s)"
+            );
+            echoes(&conn).await?;
+            until(
+                Duration::from_secs(5),
+                "a carries keep-alives again",
+                Box::new(|| client.relay_datagrams(&url_a, &remote).sent > a_before.sent),
+            )
+            .await?;
+            assert!(conn.close_reason().is_none(), "round {round}: connection stayed open after reopen");
+        }
+        println!("EMBER-RESULT policy-reopen rounds (5x): {reopen_times:?}");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: on an endpoint with `Builder::home_on_every_relay`, `remove_relay` closes paths through that relay
+    /// without reconnecting to it or burning `relay_lost`, and `insert_relay` reopens the path once the relay
+    /// reconnects (alone and combined with `set_disabled_relays` in either call order).
+    #[tokio::test]
+    #[traced_test]
+    async fn endpoint_home_on_every_relay_remove_and_insert_relay_reopens_path() -> Result {
+        let (map_a, url_a, relay_a) = run_relay_server().await?;
+        let (map_b, url_b, relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .default_path_max_idle_timeout(Duration::from_secs(3))
+                            .build(),
+                    )
+                    .clear_ip_transports()
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(51).await?;
+        let client = bind(50).await?;
+        let echo = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = echo.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let got = recv.read_to_end(64).await.unwrap_or_default();
+                        send.write_all(&got).await.ok();
+                        send.finish().ok();
+                    }
+                });
+            }
+        });
+        let both = |homes: &[RelayUrl], named: &[RelayUrl]| {
+            [&url_a, &url_b]
+                .iter()
+                .all(|u| homes.contains(u) && named.contains(u))
+        };
+        let _ = relays_until(&server, both).await?;
+        let _ = relays_until(&client, both).await?;
+
+        let echoes = async |conn: &Connection| -> Result {
+            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+            send.write_all(b"still there").await.anyerr()?;
+            send.finish().anyerr()?;
+            assert_eq!(recv.read_to_end(64).await.anyerr()?, b"still there");
+            Ok(())
+        };
+        let through = |conn: &Connection, url: &RelayUrl| {
+            conn.paths()
+                .iter()
+                .any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()))
+        };
+        let sent = |r: &iroh_relay::server::Server| r.metrics().server.send_packets_recv.get();
+        let until = async |limit: Duration, what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+            time::timeout(limit, async {
+                while !cond() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| n0_error::anyerr!("{what}: not in {limit:?}"))
+        };
+
+        let remote = server.id();
+        let conn = client.connect(server.addr(), TEST_ALPN).await?;
+        echoes(&conn).await?;
+        until(
+            Duration::from_secs(10),
+            "both relay paths established",
+            Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+
+        let mut insert_reopen_times = Vec::new();
+        for removed in [url_a.clone(), url_b.clone(), url_a.clone()] {
+            let (kept, removed_srv, kept_srv) = if removed == url_a {
+                (&url_b, &relay_a, &relay_b)
+            } else {
+                (&url_a, &relay_b, &relay_a)
+            };
+            client.remove_relay(&removed).await;
+            let (homes, _) = relays_until(&client, |homes, _| !homes.contains(&removed)).await?;
+            assert!(!homes.contains(&removed), "still home on {removed}: {homes:?}");
+            until(
+                Duration::from_secs(3),
+                "path through removed relay closed",
+                Box::new(|| !through(&conn, &removed) && through(&conn, kept)),
+            )
+            .await?;
+            // Let any in-flight packet settle, then confirm removed relay forwards nothing more while kept keeps alive.
+            let k0 = sent(kept_srv);
+            until(
+                Duration::from_secs(5),
+                "kept relay carries keep-alives",
+                Box::new(|| sent(kept_srv) >= k0 + 4),
+            )
+            .await?;
+            let r_settled = sent(removed_srv);
+            let k1 = sent(kept_srv);
+            until(
+                Duration::from_secs(5),
+                "second window on kept relay",
+                Box::new(|| sent(kept_srv) >= k1 + 8),
+            )
+            .await?;
+            assert_eq!(
+                sent(removed_srv),
+                r_settled,
+                "removed relay {removed} still carried packets"
+            );
+            echoes(&conn).await?;
+            assert!(conn.close_reason().is_none(), "connection stayed open after remove_relay");
+
+            let inserted_at = time::Instant::now();
+            client
+                .insert_relay(removed.clone(), Arc::new(RelayConfig::from(removed.clone())))
+                .await;
+            until(
+                Duration::from_secs(3),
+                "path through reinserted relay reopened",
+                Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+            )
+            .await?;
+            let took = inserted_at.elapsed();
+            insert_reopen_times.push(took);
+            info!(%removed, ?took, "reinserted relay path reopened");
+            assert!(took <= Duration::from_secs(3), "reinsert reopen took {took:?} (> 3s)");
+            echoes(&conn).await?;
+            assert!(conn.close_reason().is_none(), "connection stayed open after insert_relay");
+        }
+
+        // Combined disable + remove followed by both wakeup orders (`clear -> insert` and `insert -> clear`).
+        for clear_first in [true, false] {
+            client
+                .set_disabled_relays(remote, [url_a.clone()].into())
+                .await;
+            client.remove_relay(&url_a).await;
+            until(
+                Duration::from_secs(3),
+                "combined narrow closed a",
+                Box::new(|| !through(&conn, &url_a) && through(&conn, &url_b)),
+            )
+            .await?;
+            let started = time::Instant::now();
+            if clear_first {
+                client.set_disabled_relays(remote, Default::default()).await;
+                client
+                    .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+                    .await;
+            } else {
+                client
+                    .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+                    .await;
+                client.set_disabled_relays(remote, Default::default()).await;
+            }
+            until(
+                Duration::from_secs(3),
+                "combined widen reopened a",
+                Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+            )
+            .await?;
+            assert!(started.elapsed() <= Duration::from_secs(3));
+            echoes(&conn).await?;
+            assert!(conn.close_reason().is_none());
+        }
+
+        println!("EMBER-RESULT insert-relay reopen times: {insert_reopen_times:?}");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: while a relay is disabled for a remote (or outside `Builder::relay_allowlist`), offering its address
+    /// again via address lookup, a new dial, or `insert_relay` opens no path and sends no datagram through it;
+    /// clearing the remote's disabled set restores only relays inside `relay_allowlist`.
+    #[tokio::test]
+    #[traced_test]
+    async fn disabled_and_unlisted_relays_stay_closed_across_lookup_and_reinsert() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let (map_c, url_c, _relay_c) = run_relay_server().await?;
+        let server_relays = RelayMap::empty();
+        server_relays.extend(&map_a);
+        server_relays.extend(&map_b);
+        server_relays.extend(&map_c);
+        let client_relays = RelayMap::empty();
+        client_relays.extend(&map_a);
+        client_relays.extend(&map_b);
+
+        let server = bind_on_relays(&server_relays, 61).await?;
+        let _accepting = accepting(&server);
+        let _ = relays_until(&server, |homes, _| {
+            [&url_a, &url_b, &url_c].iter().all(|u| homes.contains(u))
+        })
+        .await?;
+
+        let lookup = crate::address_lookup::MemoryLookup::new();
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(60);
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(client_relays))
+            .relay_allowlist([url_a.clone(), url_b.clone()])
+            .address_lookup(lookup.clone())
+            .home_on_every_relay()
+            .transport_config(
+                crate::endpoint::QuicTransportConfig::builder()
+                    .default_path_keep_alive_interval(Duration::from_millis(200))
+                    .default_path_max_idle_timeout(Duration::from_secs(3))
+                    .build(),
+            )
+            .clear_ip_transports()
+            .bind()
+            .await?;
+
+        let through = |conn: &Connection, url: &RelayUrl| {
+            conn.paths()
+                .iter()
+                .any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()))
+        };
+        let until = async |limit: Duration, what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+            time::timeout(limit, async {
+                while !cond() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| n0_error::anyerr!("{what}: not in {limit:?}"))
+        };
+
+        let remote = server.id();
+        let full_addr = server.addr();
+        let conn = client.connect(full_addr.clone(), TEST_ALPN).await?;
+        until(
+            Duration::from_secs(10),
+            "paths through allowed relays a and b established",
+            Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+        assert!(!through(&conn, &url_c), "unlisted relay c must never open");
+
+        client
+            .set_disabled_relays(remote, [url_a.clone()].into())
+            .await;
+        let a_disabled = client.relay_datagrams(&url_a, &remote);
+        let b_disabled = client.relay_datagrams(&url_b, &remote);
+        until(
+            Duration::from_secs(3),
+            "path through a closed",
+            Box::new(|| !through(&conn, &url_a)),
+        )
+        .await?;
+
+        // Offer a and c again via lookup, via a second dial, and via remove+insert of a while a stays disabled for remote.
+        lookup.add_endpoint_info(full_addr.clone());
+        let second = client.connect(full_addr, TEST_ALPN).await?;
+        client.remove_relay(&url_a).await;
+        client
+            .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+            .await;
+        assert!(
+            client
+                .insert_relay(url_c.clone(), Arc::new(RelayConfig::from(url_c.clone())))
+                .await
+                .is_none(),
+            "allowlist must still reject c"
+        );
+        let _ = relays_until(&client, |homes, _| homes.contains(&url_a)).await?;
+
+        until(
+            Duration::from_secs(5),
+            "b kept alive for several rounds while a is disabled",
+            Box::new(|| client.relay_datagrams(&url_b, &remote).sent >= b_disabled.sent + 10),
+        )
+        .await?;
+        assert!(!through(&conn, &url_a) && !through(&second, &url_a), "disabled relay a opened a path");
+        assert!(!through(&conn, &url_c) && !through(&second, &url_c), "unlisted relay c opened a path");
+        assert_eq!(
+            client.relay_datagrams(&url_a, &remote).sent,
+            a_disabled.sent,
+            "datagrams handed to a while disabled despite lookup/dial/insert_relay"
+        );
+        assert_eq!(client.relay_datagrams(&url_c, &remote).sent, 0, "datagrams handed to unlisted relay c");
+
+        // Clearing disabled restores a (inside allowlist) on both connections, while c (outside allowlist) stays closed.
+        client.set_disabled_relays(remote, Default::default()).await;
+        until(
+            Duration::from_secs(3),
+            "both connections reopen path through a",
+            Box::new(|| through(&conn, &url_a) && through(&second, &url_a)),
+        )
+        .await?;
+        assert!(!through(&conn, &url_c) && !through(&second, &url_c), "unlisted relay c must remain closed");
+        assert_eq!(client.relay_datagrams(&url_c, &remote).sent, 0);
+
+        conn.close(0u8.into(), b"");
+        second.close(0u8.into(), b"");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: if `remove_relay(X)` is submitted while an earlier `insert_relay(X)` is mid-flight inside the socket
+    /// actor, `X` ends absent from `relay_map` AND `relay_policies.is_removed(&X)` stays `true`: its path is closed,
+    /// zero datagrams are handed on or forwarded through `X` (even on a subsequent dial naming `X`), and `X` never
+    /// reopens until a new `insert_relay(X)` is called.
+    #[tokio::test]
+    #[traced_test]
+    async fn concurrent_insert_and_remove_relay_keeps_removed_tombstone_consistent() -> Result {
+        let (map_a, url_a, relay_a) = run_relay_server().await?;
+        let (map_b, url_b, relay_b) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .default_path_max_idle_timeout(Duration::from_secs(3))
+                            .build(),
+                    )
+                    .clear_ip_transports()
+                    .bind()
+                    .await
+            }
+        };
+        let server = bind(71).await?;
+        let client = bind(70).await?;
+        let _accepting = accepting(&server);
+        let both = |homes: &[RelayUrl], named: &[RelayUrl]| {
+            [&url_a, &url_b]
+                .iter()
+                .all(|u| homes.contains(u) && named.contains(u))
+        };
+        let _ = relays_until(&server, both).await?;
+        let _ = relays_until(&client, both).await?;
+
+        let through = |conn: &Connection, url: &RelayUrl| {
+            conn.paths()
+                .iter()
+                .any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()))
+        };
+        let until =
+            async |limit: Duration, what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+                time::timeout(limit, async {
+                    while !cond() {
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| n0_error::anyerr!("{what}: not in {limit:?}"))
+            };
+        let sent = |r: &iroh_relay::server::Server| r.metrics().server.send_packets_recv.get();
+
+        let remote = server.id();
+        let full_addr = server.addr();
+        let conn = client.connect(full_addr.clone(), TEST_ALPN).await?;
+        until(
+            Duration::from_secs(10),
+            "initial paths on a and b established",
+            Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+
+        // Start from `url_a` removed so `insert_relay(url_a)` transitions `removed -> present`.
+        assert!(client.remove_relay(&url_a).await.is_some());
+        until(
+            Duration::from_secs(3),
+            "a initially closed",
+            Box::new(|| !through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+
+        // Hold `RelayInserted(url_a)` mid-handler right after `transports_network_change.insert_relay`, enqueue
+        // `remove_relay(&url_a)` behind it, then release.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        client
+            .inner
+            .set_pause_next_relay_insert(entered.clone(), release.clone());
+
+        let insert_task = tokio::spawn({
+            let client = client.clone();
+            let url_a = url_a.clone();
+            async move {
+                client
+                    .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a)))
+                    .await
+            }
+        });
+        time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .anyerr()?;
+
+        let remove_task = tokio::spawn({
+            let client = client.clone();
+            let url_a = url_a.clone();
+            async move { client.remove_relay(&url_a).await }
+        });
+        // Yield until `remove_task` is parked awaiting `ActorMessage::RelayRemoved` behind `RelayInserted`.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+
+        let insert_prev = time::timeout(Duration::from_secs(5), insert_task)
+            .await
+            .anyerr()?
+            .anyerr()?;
+        let remove_prev = time::timeout(Duration::from_secs(5), remove_task)
+            .await
+            .anyerr()?
+            .anyerr()?;
+        assert!(insert_prev.is_none(), "insert into absent slot returns None");
+        assert!(
+            remove_prev.is_some(),
+            "subsequent remove observes inserted config"
+        );
+
+        assert!(
+            client.inner.is_relay_removed(&url_a),
+            "tombstone must remain true after insert -> remove"
+        );
+        assert!(
+            !client.inner.contains_relay(&url_a),
+            "relay_map must not contain removed relay"
+        );
+        let (homes, named) =
+            relays_until(&client, |homes, named| !homes.contains(&url_a) && !named.contains(&url_a))
+                .await?;
+        assert!(!homes.contains(&url_a) && !named.contains(&url_a));
+        assert!(!through(&conn, &url_a) && through(&conn, &url_b));
+
+        // Let any in-flight packet settle, then dial again with `full_addr` (which still advertises `url_a` for server)
+        // and verify `url_a` neither receives new datagrams nor reopens without a subsequent `insert_relay`.
+        let b0 = sent(&relay_b);
+        until(
+            Duration::from_secs(5),
+            "b advances keep-alives",
+            Box::new(|| sent(&relay_b) >= b0 + 4),
+        )
+        .await?;
+        let a_handed = client.relay_datagrams(&url_a, &remote);
+        let a_srv = sent(&relay_a);
+        let second = client.connect(full_addr, TEST_ALPN).await?;
+        let b1 = sent(&relay_b);
+        until(
+            Duration::from_secs(5),
+            "b advances further across second dial",
+            Box::new(|| sent(&relay_b) >= b1 + 10),
+        )
+        .await?;
+        assert!(!through(&conn, &url_a) && !through(&second, &url_a));
+        assert_eq!(
+            client.relay_datagrams(&url_a, &remote).sent,
+            a_handed.sent,
+            "removed relay handed datagrams after concurrent insert/remove"
+        );
+        assert_eq!(
+            sent(&relay_a),
+            a_srv,
+            "removed relay server forwarded packets after concurrent insert/remove"
+        );
+
+        // A subsequent `insert_relay` cleanly clears the tombstone and reopens `url_a` on both connections.
+        client
+            .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+            .await;
+        until(
+            Duration::from_secs(3),
+            "subsequent insert_relay reopens a on both connections",
+            Box::new(|| through(&conn, &url_a) && through(&second, &url_a)),
+        )
+        .await?;
+
+        conn.close(0u8.into(), b"");
+        second.close(0u8.into(), b"");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: canceling an unestablished (still-opening) relay path via `set_disabled_relays` or `remove_relay`
+    /// settles one unit of `relay_lost_total`, capping cumulative unestablished relay path allocations at
+    /// `RELAY_CONN_LOST_MAX` (6) across 10 blackhole churn rounds so `MAX_MULTIPATH_PATHS` (8) retains room for a
+    /// subsequent non-relay (`Custom`) path on the same connection.
+    #[cfg(feature = "unstable-custom-transports")]
+    #[tokio::test]
+    #[traced_test]
+    async fn canceling_opening_relay_paths_counts_toward_connection_lost_budget() -> Result {
+        let (_map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let client_relays = RelayMap::from_iter([url_a.clone(), url_b.clone()]);
+
+        let custom_net = crate::test_utils::test_transport::TestNetwork::new();
+        let mut server_rng = rand_chacha::ChaCha8Rng::seed_from_u64(81);
+        let server_key = SecretKey::from_bytes(&server_rng.random());
+        let server_custom = custom_net.create_transport(server_key.public()).anyerr()?;
+        let server_custom_addr = TransportAddr::Custom(
+            crate::endpoint::transports::CustomEndpoint::watch_local_addrs(&*server_custom)
+                .get()
+                .into_iter()
+                .next()
+                .expect("server custom transport addr"),
+        );
+        let mut client_rng = rand_chacha::ChaCha8Rng::seed_from_u64(80);
+        let client_key = SecretKey::from_bytes(&client_rng.random());
+        let client_custom = custom_net.create_transport(client_key.public()).anyerr()?;
+
+        // Server is home ONLY on `url_b` (not `url_a`), so any `PATH_CHALLENGE` sent via `url_a` is blackholed and
+        // stays unestablished while opening. Both endpoints carry `TestTransport` without auto-lookup so the custom
+        // path is opened only after the 10 blackhole rounds.
+        let server = Endpoint::builder(presets::Minimal)
+            .secret_key(server_key)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(map_b))
+            .add_custom_transport(server_custom)
+            .transport_config(
+                crate::endpoint::QuicTransportConfig::builder()
+                    .default_path_keep_alive_interval(Duration::from_millis(200))
+                    .default_path_max_idle_timeout(Duration::from_secs(3))
+                    .build(),
+            )
+            .clear_ip_transports()
+            .bind()
+            .await?;
+        let echo = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = echo.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let got = recv.read_to_end(64).await.unwrap_or_default();
+                        send.write_all(&got).await.ok();
+                        send.finish().ok();
+                    }
+                });
+            }
+        });
+        let _ = relays_until(&server, |homes, _| homes.contains(&url_b)).await?;
+
+        let client = Endpoint::builder(presets::Minimal)
+            .secret_key(client_key)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(client_relays))
+            .home_on_every_relay()
+            .add_custom_transport(client_custom)
+            .transport_config(
+                crate::endpoint::QuicTransportConfig::builder()
+                    .default_path_keep_alive_interval(Duration::from_millis(200))
+                    .default_path_max_idle_timeout(Duration::from_secs(3))
+                    .build(),
+            )
+            .clear_ip_transports()
+            .bind()
+            .await?;
+        let _ = relays_until(&client, |homes, _| {
+            homes.contains(&url_a) && homes.contains(&url_b)
+        })
+        .await?;
+
+        let echoes = async |conn: &Connection| -> Result {
+            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+            send.write_all(b"healthy on b").await.anyerr()?;
+            send.finish().anyerr()?;
+            assert_eq!(recv.read_to_end(64).await.anyerr()?, b"healthy on b");
+            Ok(())
+        };
+        let until =
+            async |limit: Duration, what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+                time::timeout(limit, async {
+                    while !cond() {
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| n0_error::anyerr!("{what}: not in {limit:?}"))
+            };
+
+        let remote = server.id();
+        let initial_addr = EndpointAddr::new(remote)
+            .with_relay_url(url_b.clone())
+            .with_relay_url(url_a.clone());
+        let conn = client
+            .connect_with_opts(
+                initial_addr,
+                TEST_ALPN,
+                ConnectOptions::new().with_disabled_relays([url_a.clone()]),
+            )
+            .await?
+            .await
+            .anyerr()?;
+        let stable_id = conn.stable_id();
+        echoes(&conn).await?;
+        assert_eq!(client.relay_datagrams(&url_a, &remote).sent, 0);
+
+        // Each round re-enables `url_a` (`set_disabled_relays([])` or `insert_relay`), observes at most 6 opening
+        // attempts (`RELAY_CONN_LOST_MAX = 6`: PathIds 1..=6), and cancels the unestablished opening path via
+        // `set_disabled_relays([url_a])` or `remove_relay(&url_a)`.
+        let mut a_sent_prev = 0u64;
+        for round in 1..=10 {
+            if matches!(round, 5 | 6 | 9 | 10) {
+                client
+                    .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+                    .await;
+                let _ = relays_until(&client, |homes, _| homes.contains(&url_a)).await?;
+            } else {
+                client.set_disabled_relays(remote, Default::default()).await;
+            }
+
+            if round <= 6 {
+                until(
+                    Duration::from_secs(3),
+                    &format!("round {round}: opening attempt on blackhole a transmits"),
+                    Box::new(|| client.relay_datagrams(&url_a, &remote).sent > a_sent_prev),
+                )
+                .await?;
+            } else {
+                // Past `RELAY_CONN_LOST_MAX = 6`, zero further opening attempts may be made on `url_a`.
+                time::sleep(Duration::from_millis(80)).await;
+                assert_eq!(
+                    client.relay_datagrams(&url_a, &remote).sent,
+                    a_sent_prev,
+                    "round {round}: exceeded RELAY_CONN_LOST_MAX = 6 on blackholed relay a"
+                );
+            }
+
+            if matches!(round, 4 | 5 | 8 | 9) {
+                client.remove_relay(&url_a).await;
+            } else {
+                client
+                    .set_disabled_relays(remote, [url_a.clone()].into())
+                    .await;
+            }
+            a_sent_prev = client.relay_datagrams(&url_a, &remote).sent;
+            echoes(&conn).await?;
+            assert!(
+                conn.close_reason().is_none(),
+                "round {round}: connection on b stayed open"
+            );
+        }
+
+        // Prove `MAX_MULTIPATH_PATHS` (8: PathId 0 on `url_b`, PathIds 1..=6 burned on `url_a`, PathId 7 still free)
+        // still has headroom for another transport kind on the exact same connection.
+        let resolved = client
+            .inner
+            .resolve_remote(EndpointAddr::from_parts(remote, [server_custom_addr.clone()]))
+            .await
+            .anyerr()?;
+        assert!(resolved.is_ok());
+        until(
+            Duration::from_secs(3),
+            "custom path opens on remaining PathId(7) of the same connection",
+            Box::new(|| {
+                conn.paths()
+                    .iter()
+                    .any(|p| p.remote_addr() == &server_custom_addr)
+            }),
+        )
+        .await?;
+        assert_eq!(conn.stable_id(), stable_id);
+        echoes(&conn).await?;
+        assert!(conn.close_reason().is_none());
+
+        conn.close(0u8.into(), b"");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: once per-relay `relay_lost` reaches `RELAY_PATH_LOST_MAX` (2), ordinary home-relay reconnects (without
+    /// `insert_relay`) keep `relay_lost` capped as before, whereas `Endpoint::insert_relay` clears per-relay
+    /// `relay_lost` and reopens the path both when the relay is already connected (no watch state diff) and across
+    /// back-to-back `remove_relay` + `insert_relay`.
+    #[tokio::test]
+    #[traced_test]
+    async fn insert_relay_recovers_after_per_relay_lost_cap_while_ordinary_reconnect_stays_capped(
+    ) -> Result {
+        let (_map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (_map_b, url_b, _relay_b) = run_relay_server().await?;
+
+        let bind_with = |relays: RelayMap, seed: u64| async move {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+            Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&rng.random()))
+                .alpns(vec![TEST_ALPN.to_vec()])
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .relay_mode(RelayMode::Custom(relays))
+                .home_on_every_relay()
+                .transport_config(
+                    crate::endpoint::QuicTransportConfig::builder()
+                        .default_path_keep_alive_interval(Duration::from_millis(100))
+                        .default_path_max_idle_timeout(Duration::from_millis(500))
+                        .build(),
+                )
+                .clear_ip_transports()
+                .bind()
+                .await
+        };
+
+        let through = |conn: &Connection, url: &RelayUrl| {
+            conn.paths()
+                .iter()
+                .any(|p| p.remote_addr() == &TransportAddr::Relay(url.clone()))
+        };
+        let until =
+            async |limit: Duration, what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| -> Result {
+                time::timeout(limit, async {
+                    while !cond() {
+                        time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| n0_error::anyerr!("{what}: not in {limit:?}"))
+            };
+
+        // Bind `server` with 2 home slots (`[url_a, url_b]`), then remove `url_a` before `client` connects so
+        // `client`'s initial + retry attempts on `url_a` time out twice (500ms idle + 2s `RELAY_REOPEN` + 500ms idle)
+        // and hit `RELAY_PATH_LOST_MAX = 2`, while later `server.insert_relay(url_a)` restores `server`'s home on `url_a`.
+        let both_relays = RelayMap::from_iter([url_a.clone(), url_b.clone()]);
+        let server = bind_with(both_relays.clone(), 93).await?;
+        let _accepting = accepting(&server);
+        let _ = relays_until(&server, |homes, _| {
+            homes.contains(&url_a) && homes.contains(&url_b)
+        })
+        .await?;
+        server.remove_relay(&url_a).await;
+        let _ = relays_until(&server, |homes, _| !homes.contains(&url_a)).await?;
+
+        let client = bind_with(both_relays, 92).await?;
+        let _ = relays_until(&client, |homes, _| {
+            homes.contains(&url_a) && homes.contains(&url_b)
+        })
+        .await?;
+        let remote = server.id();
+        let conn = client
+            .connect(
+                EndpointAddr::new(remote)
+                    .with_relay_url(url_b.clone())
+                    .with_relay_url(url_a.clone()),
+                TEST_ALPN,
+            )
+            .await?;
+
+        // Wait for `url_a` to hit `RELAY_PATH_LOST_MAX = 2` (`relay_lost_total == 2 < 6`).
+        time::sleep(Duration::from_millis(3600)).await;
+        let capped_sent = client.relay_datagrams(&url_a, &remote).sent;
+        time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(client.relay_datagrams(&url_a, &remote).sent, capped_sent);
+        assert!(!through(&conn, &url_a) && through(&conn, &url_b));
+
+        // Bring `server` back onto `url_a` so `url_a` is now end-to-end reachable.
+        server
+            .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+            .await;
+        let _ = relays_until(&server, |homes, _| {
+            homes.contains(&url_a) && homes.contains(&url_b)
+        })
+        .await?;
+
+        // 1. Ordinary reconnect on `client` (`ReconnectRelays` via `set_relay_udp` toggle, cycling `Connecting -> Connected`
+        // without `insert_relay`) must NOT clear `relay_lost` or reopen `url_a`.
+        client.set_relay_udp(true).await;
+        client.set_relay_udp(false).await;
+        let _ = relays_until(&client, |homes, _| {
+            homes.contains(&url_a) && homes.contains(&url_b)
+        })
+        .await?;
+        time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !through(&conn, &url_a),
+            "ordinary home-relay reconnect without insert_relay must not clear per-relay relay_lost"
+        );
+        assert_eq!(client.relay_datagrams(&url_a, &remote).sent, capped_sent);
+
+        // 2. Calling `client.insert_relay(url_a)` while `url_a` is ALREADY `Connected` (zero watch state diff) clears
+        // `relay_lost` and immediately reopens `url_a`; back-to-back `remove_relay` + `insert_relay` (coalesced watch
+        // transition) also reopens cleanly.
+        client
+            .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+            .await;
+        until(
+            Duration::from_secs(3),
+            "insert_relay on already-connected relay clears relay_lost and reopens a",
+            Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+
+        client.remove_relay(&url_a).await;
+        client
+            .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+            .await;
+        until(
+            Duration::from_secs(3),
+            "back-to-back remove_relay + insert_relay reopens a despite watch coalescing",
+            Box::new(|| through(&conn, &url_a) && through(&conn, &url_b)),
+        )
+        .await?;
+        assert!(conn.close_reason().is_none());
+
+        conn.close(0u8.into(), b"");
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// ember: multiple active client connections continuously exchanging bidirectional streams complete concurrent
+    /// `remove_relay`, `insert_relay`, and `set_disabled_relays` churn within bounded time with zero deadlocks and
+    /// zero dropped connections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[traced_test]
+    async fn concurrent_streams_under_repeated_relay_remove_insert_and_policy_churn() -> Result {
+        let (map_a, url_a, _relay_a) = run_relay_server().await?;
+        let (map_b, url_b, _relay_b) = run_relay_server().await?;
+        let (map_c, url_c, _relay_c) = run_relay_server().await?;
+        let relays = RelayMap::empty();
+        relays.extend(&map_a);
+        relays.extend(&map_b);
+        relays.extend(&map_c);
+
+        let bind = |seed: u64| {
+            let relays = relays.clone();
+            async move {
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                Endpoint::builder(presets::Minimal)
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relays))
+                    .home_on_every_relay()
+                    .transport_config(
+                        crate::endpoint::QuicTransportConfig::builder()
+                            .default_path_keep_alive_interval(Duration::from_millis(200))
+                            .default_path_max_idle_timeout(Duration::from_secs(3))
+                            .build(),
+                    )
+                    .clear_ip_transports()
+                    .bind()
+                    .await
+            }
+        };
+
+        let server = bind(101).await?;
+        let client = bind(100).await?;
+        let echo = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = echo.accept().await {
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let got = recv.read_to_end(128).await.unwrap_or_default();
+                        send.write_all(&got).await.ok();
+                        send.finish().ok();
+                    }
+                });
+            }
+        });
+        let all_three = |homes: &[RelayUrl], named: &[RelayUrl]| {
+            [&url_a, &url_b, &url_c]
+                .iter()
+                .all(|u| homes.contains(u) && named.contains(u))
+        };
+        let _ = relays_until(&server, all_three).await?;
+        let _ = relays_until(&client, all_three).await?;
+
+        let remote = server.id();
+        let addr = server.addr();
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            conns.push(client.connect(addr.clone(), TEST_ALPN).await?);
+        }
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut stream_tasks = Vec::new();
+        for (idx, conn) in conns.iter().cloned().enumerate() {
+            let stop = stop.clone();
+            stream_tasks.push(tokio::spawn(async move {
+                let mut count = 0u64;
+                while !stop.is_cancelled() {
+                    let payload = format!("conn-{idx}-msg-{count}").into_bytes();
+                    let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+                    send.write_all(&payload).await.anyerr()?;
+                    send.finish().anyerr()?;
+                    let echoed = recv.read_to_end(128).await.anyerr()?;
+                    assert_eq!(echoed, payload);
+                    count += 1;
+                    time::sleep(Duration::from_millis(15)).await;
+                }
+                Ok::<u64, n0_error::AnyError>(count)
+            }));
+        }
+
+        // Concurrently churn `remove_relay` / `insert_relay` on `url_a` & `url_b` and `set_disabled_relays` on
+        // `remote` while keeping `url_c` available so every connection always has at least one live relay.
+        time::timeout(Duration::from_secs(15), async {
+            let churn_ab = {
+                let client = client.clone();
+                let url_a = url_a.clone();
+                let url_b = url_b.clone();
+                async move {
+                    for round in 0..12 {
+                        let target = if round % 2 == 0 { &url_a } else { &url_b };
+                        client.remove_relay(target).await;
+                        client
+                            .insert_relay(target.clone(), Arc::new(RelayConfig::from(target.clone())))
+                            .await;
+                    }
+                }
+            };
+            let churn_policy = {
+                let client = client.clone();
+                let url_a = url_a.clone();
+                let url_b = url_b.clone();
+                async move {
+                    for round in 0..16 {
+                        let set: std::collections::BTreeSet<RelayUrl> = match round % 4 {
+                            0 => [url_a.clone()].into(),
+                            1 => [url_b.clone()].into(),
+                            2 => [url_a.clone(), url_b.clone()].into(),
+                            _ => Default::default(),
+                        };
+                        client.set_disabled_relays(remote, set).await;
+                    }
+                    client.set_disabled_relays(remote, Default::default()).await;
+                }
+            };
+            tokio::join!(churn_ab, churn_policy);
+        })
+        .await
+        .anyerr()?;
+
+        stop.cancel();
+        for task in stream_tasks {
+            let completed = time::timeout(Duration::from_secs(5), task)
+                .await
+                .anyerr()?
+                .anyerr()??;
+            assert!(completed > 0, "each connection exchanged streams under churn");
+        }
+        for conn in &conns {
+            assert!(conn.close_reason().is_none(), "no connection dropped under churn");
+        }
+
+        // Settle back with all three relays inserted and none disabled: existing connections stay live and complete
+        // fresh stream roundtrips (connections whose tight-loop churn canceled 6 unestablished openings hit
+        // `RELAY_CONN_LOST_MAX`), and a fresh connection establishes paths across all three relays.
+        client
+            .insert_relay(url_a.clone(), Arc::new(RelayConfig::from(url_a.clone())))
+            .await;
+        client
+            .insert_relay(url_b.clone(), Arc::new(RelayConfig::from(url_b.clone())))
+            .await;
+        client.set_disabled_relays(remote, Default::default()).await;
+        let _ = relays_until(&client, all_three).await?;
+        for (idx, conn) in conns.iter().enumerate() {
+            let payload = format!("post-churn-{idx}").into_bytes();
+            let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+            send.write_all(&payload).await.anyerr()?;
+            send.finish().anyerr()?;
+            assert_eq!(recv.read_to_end(128).await.anyerr()?, payload);
+        }
+        let fresh = client.connect(addr, TEST_ALPN).await?;
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ok = [&url_a, &url_b, &url_c].iter().all(|u| {
+                    fresh
+                        .paths()
+                        .iter()
+                        .any(|p| p.remote_addr() == &TransportAddr::Relay((*u).clone()))
+                });
+                if ok {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .anyerr()?;
+        fresh.close(0u8.into(), b"");
+
+        for conn in conns {
+            conn.close(0u8.into(), b"");
+        }
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn endpoint_two_relay_only_no_ip() -> Result {

@@ -64,6 +64,10 @@ impl<K: Hash + Eq, V> ReadOnlyMap<K, V> {
         self.0.guard()
     }
 
+    pub(crate) fn keys<'g, G: papaya::Guard>(&self, guard: &'g G) -> papaya::Keys<'g, K, V, G> {
+        self.0.keys(guard)
+    }
+
     pub(crate) fn values<'g, G: papaya::Guard>(&self, guard: &'g G) -> papaya::Values<'g, K, V, G> {
         self.0.values(guard)
     }

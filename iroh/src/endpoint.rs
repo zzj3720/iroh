@@ -3423,6 +3423,8 @@ mod tests {
                     .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                     .relay_mode(RelayMode::Custom(relays))
                     .home_on_every_relay()
+                    // ember: this test needs direct traffic with relay backups, independent of local RTTs.
+                    .relay_last()
                     .transport_config(
                         crate::endpoint::QuicTransportConfig::builder()
                             .default_path_keep_alive_interval(Duration::from_millis(200))
@@ -3643,6 +3645,8 @@ mod tests {
                     .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                     .relay_mode(RelayMode::Custom(relays))
                     .home_on_every_relay()
+                    // ember: this test needs direct traffic with relay backups, independent of local RTTs.
+                    .relay_last()
                     .transport_config(
                         crate::endpoint::QuicTransportConfig::builder()
                             .default_path_keep_alive_interval(Duration::from_millis(200))

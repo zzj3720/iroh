@@ -59,3 +59,12 @@ through the socket actor: `remove_relay` closes established paths at once withou
 canceling unestablished opening paths accounts toward `RELAY_CONN_LOST_MAX`, and `insert_relay` reopens client paths
 once that inserted relay connects while leaving ordinary home-relay reconnects unchanged. `Builder::relay_allowlist`
 remains an immutable ceiling, and per-remote `disabled_relays` continues to override `insert_relay`.
+
+On `Builder::home_on_every_relay` endpoints, `RelayActor::active_relay_handle_for_endpoint` never substitutes another
+open relay via `endpoints_present` when addressing a relay URL that has no active connection yet: `relay[0]` dials that
+URL itself (opening a genuine path when the peer is on that relay, such as a workspace relay or emergency public relay,
+and opening no misnamed path when the peer is absent), while single-home endpoints keep upstream's `endpoints_present`
+shortcut. Non-home `ActiveRelayActor`s extend their 60 s `RELAY_INACTIVE_CLEANUP_TIME` deadline only when outgoing
+datagrams are actually queued and honor that idle deadline across both pending handshakes and reconnect backoffs, so an
+unreachable or idle extra relay is reclaimed instead of retrying until endpoint shutdown.
+

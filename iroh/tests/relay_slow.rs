@@ -70,7 +70,7 @@ async fn endpoint_home_on_every_relay_leaves_a_relay_gone_slow() -> Result {
     let bind = |seed: u64| {
         let relays = relays.clone();
         async move {
-            Endpoint::builder(presets::N0)
+            Endpoint::builder(presets::Minimal)
                 .secret_key(SecretKey::from_bytes(&[seed as u8 + 1; 32]))
                 .alpns(vec![TEST_ALPN.to_vec()])
                 .ca_tls_config(CaTlsConfig::insecure_skip_verify())
@@ -180,7 +180,7 @@ async fn new_connection_races_relays_despite_an_existing_selected_path() -> Resu
     let via_a = delayed_relay(&url_a, delay_a.clone()).await?;
     let via_b = delayed_relay(&url_b, delay_b.clone()).await?;
     let relays = RelayMap::from_iter([via_a.clone(), via_b.clone()]);
-    let bind = || Endpoint::builder(presets::N0)
+    let bind = || Endpoint::builder(presets::Minimal)
         .alpns(vec![TEST_ALPN.to_vec()])
         .ca_tls_config(CaTlsConfig::insecure_skip_verify())
         .relay_mode(RelayMode::Custom(relays.clone()))

@@ -185,6 +185,9 @@ pub(crate) struct Options {
     /// ember: immutable relay URL ceiling; none preserves upstream behavior.
     pub(crate) relay_allowlist: Option<BTreeSet<RelayUrl>>,
 
+    /// ember: whether the endpoint was built with `Builder::home_on_every_relay`.
+    pub(crate) home_on_every_relay: bool,
+
     /// TLS configuration for HTTPS and non-iroh-QUIC connections.
     pub(crate) tls_config: rustls::ClientConfig,
 
@@ -409,6 +412,9 @@ pub(crate) struct Socket {
     #[cfg(test)]
     pause_next_relay_insert:
         Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// ember: test signal fired once `remove_relay` has enqueued `ActorMessage::RelayRemoved` into `actor_sender`.
+    #[cfg(test)]
+    notify_next_relay_remove_queued: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Socket {
@@ -914,6 +920,7 @@ impl EndpointInner {
             proxy_url,
             relay_udp,
             relay_allowlist,
+            home_on_every_relay,
             server_config,
             tls_config,
             metrics,
@@ -988,6 +995,7 @@ impl EndpointInner {
             excludes: Default::default(),
             own: None,
             others: Vec::new(),
+            home_on_every_relay,
         };
 
         let shutdown_state = ShutdownState::default();
@@ -1071,6 +1079,8 @@ impl EndpointInner {
             span: span.clone(),
             #[cfg(test)]
             pause_next_relay_insert: Default::default(),
+            #[cfg(test)]
+            notify_next_relay_remove_queued: Default::default(),
         });
 
         let mut endpoint_config =
@@ -1332,6 +1342,18 @@ impl EndpointInner {
             .await
             .is_ok()
         {
+            #[cfg(test)]
+            {
+                let notify = self
+                    .sock
+                    .notify_next_relay_remove_queued
+                    .lock()
+                    .expect("poisoned")
+                    .take();
+                if let Some(queued) = notify {
+                    queued.notify_one();
+                }
+            }
             rx.await.ok().flatten()
         } else {
             None
@@ -1345,6 +1367,15 @@ impl EndpointInner {
         release: Arc<tokio::sync::Notify>,
     ) {
         *self.sock.pause_next_relay_insert.lock().expect("poisoned") = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_notify_next_relay_remove_queued(&self, queued: Arc<tokio::sync::Notify>) {
+        *self
+            .sock
+            .notify_next_relay_remove_queued
+            .lock()
+            .expect("poisoned") = Some(queued);
     }
 
     #[cfg(test)]
@@ -1517,6 +1548,27 @@ impl EndpointInner {
             .await
             .ok()?;
         rx.await.ok()
+    }
+
+    /// ember: returns `(opening_for_relay, lost_for_relay, relay_lost_total)` for `conn_stable_id` on `remote` (tests).
+    #[cfg(test)]
+    pub(crate) async fn relay_loss_stats(
+        &self,
+        remote: EndpointId,
+        conn_stable_id: usize,
+        relay: &RelayUrl,
+    ) -> Option<(usize, u32, u32)> {
+        let (tx, rx) = oneshot::channel();
+        self.remote_actors
+            .get(&remote)?
+            .send(RemoteStateMessage::RelayLossStats(
+                conn_stable_id,
+                relay.clone(),
+                tx,
+            ))
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
     }
 
     /// Registers the connection in the `RemoteStateActor`.
@@ -2453,6 +2505,7 @@ mod tests {
             secret_key,
             proxy_url: None,
             relay_udp: false,
+            home_on_every_relay: false,
             relay_allowlist: None,
             dns_resolver: DnsResolver::new(),
             server_config,
@@ -2890,6 +2943,7 @@ mod tests {
             dns_resolver,
             proxy_url: None,
             relay_udp: false,
+            home_on_every_relay: false,
             relay_allowlist: None,
             server_config,
             tls_config: CaTlsConfig::default()

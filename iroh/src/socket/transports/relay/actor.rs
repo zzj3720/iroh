@@ -97,6 +97,11 @@ const ENTRY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// ember: ceiling for adaptive entry-probe backoff while the current entrance stays optimal.
 const ENTRY_PROBE_INTERVAL_MAX: Duration = Duration::from_secs(5 * 60);
 
+/// ember: minimum absolute RTT reduction required before considering an alternate entrance (`choose_entry`),
+/// preventing sub-millisecond loopback timer jitter or routine Wi-Fi/worker scheduling noise from creating
+/// candidates, resetting adaptive backoff, or churning live relay connections.
+const ENTRY_MIN_GAIN: Duration = Duration::from_millis(10);
+
 /// ember: how long closing a relay connection gracefully may take; a dead one would otherwise hold its actor.
 const CLIENT_SINK_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -507,7 +512,7 @@ impl ActiveRelayActor {
             self.candidate = None;
             return None;
         }
-        if *best_rtt * 5 >= current * 4 {
+        if current.saturating_sub(*best_rtt) < ENTRY_MIN_GAIN || *best_rtt * 5 >= current * 4 {
             self.candidate = None;
             return None;
         }
@@ -3797,5 +3802,122 @@ mod tests {
 
         rig.cancel.cancel();
         Ok(())
+    }
+
+    /// ember: when the alternate entrance is faster only by sub-10ms noise (even >20% relative on loopback or low-RTT
+    /// links), `choose_entry` neither switches nor records a candidate, so adaptive backoff reaches 300 s and holds it.
+    #[tokio::test]
+    #[traced_test]
+    async fn entry_probe_noise_only_difference_keeps_backoff_to_300s() -> Result {
+        // `relay` has +5 ms delay (~5.3 ms RTT on loopback) while `entry` has 0 ms (~0.3 ms RTT): >90% faster
+        // relatively, but only ~5 ms absolute difference (< `ENTRY_MIN_GAIN` = 10 ms).
+        let mut rig = EntryProbeRig::start(5, 0).await?;
+        let packet = RelaySendItem {
+            remote_endpoint: rig.peer,
+            url: rig.relay.url.clone(),
+            datagrams: Datagrams::from(b"stays on current entrance"),
+            queued: None,
+        };
+        assert_eq!(
+            rig.watch.get().as_ref().map(|s| s.access_url()),
+            Some(&rig.relay.url),
+            "initial sub-10ms difference must not switch entrances"
+        );
+        assert_eq!((rig.relay.accepted(), rig.entry.accepted()), (2, 1));
+
+        for (gap_secs, total_secs) in [
+            (30u64, 30u64),
+            (60, 90),
+            (120, 210),
+            (240, 450),
+            (300, 750),
+            (300, 1050),
+        ] {
+            rig.assert_silent_for(
+                Duration::from_secs(gap_secs - 2),
+                &format!("t={}s (before {total_secs}s)", total_secs - 2),
+            )
+            .await?;
+            rig.advance_expect_round(Duration::from_secs(2), &format!("t={total_secs}s"))
+                .await?;
+            assert_eq!(
+                rig.watch.get().as_ref().map(|s| s.access_url()),
+                Some(&rig.relay.url),
+                "must stay on initial entrance at t={total_secs}s"
+            );
+        }
+        send_recv_echo(packet, &rig.send_tx, &mut rig.recv_rx).await?;
+        assert_eq!((rig.relay.accepted(), rig.entry.accepted()), (8, 7));
+        rig.cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn choose_entry_requires_both_min_gain_and_relative_margin() {
+        let relay: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let entry: RelayUrl = "https://entry.example.com".parse().unwrap();
+        let (_inbox_tx, inbox) = mpsc::channel(1);
+        let (_send_tx, relay_datagrams_send) = mpsc::channel(1);
+        let (relay_datagrams_recv, _recv_rx) = mpsc::channel(1);
+        let mut actor = ActiveRelayActor::new(ActiveRelayActorOptions {
+            url: relay.clone(),
+            entries: vec![entry.clone()],
+            endpoints_present: Default::default(),
+            inbox,
+            relay_datagrams_send,
+            relay_datagrams_recv,
+            connection_opts: RelayConnectionOptions {
+                secret_key: SecretKey::generate(),
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                prefer_ipv6: Arc::new(AtomicBool::new(false)),
+                tls_config: CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .expect("infallible"),
+                auth_token: None,
+                udp: Default::default(),
+            },
+            stop_token: CancellationToken::new(),
+            metrics: Default::default(),
+            my_relay: Default::default(),
+        });
+
+        let step = |actor: &mut ActiveRelayActor, r_us: u64, e_us: u64| -> (Option<RelayUrl>, Duration) {
+            let (delay_tx, mut delay_rx) = oneshot::channel();
+            let round = super::EntryProbeRound {
+                entries_gen: actor.entries_gen,
+                round_epoch: actor.probe_epoch,
+                delay_tx,
+            };
+            let chosen = actor.on_entry_samples(
+                vec![
+                    (relay.clone(), Duration::from_micros(r_us)),
+                    (entry.clone(), Duration::from_micros(e_us)),
+                ],
+                Some(round),
+                true,
+            );
+            (chosen, delay_rx.try_recv().unwrap())
+        };
+
+        // Sub-ms loopback noise (500us vs 200us: 60% faster, 0.3ms < 10ms) and 30ms vs 22ms (26.7% faster, 8ms < 10ms)
+        // never create a candidate and back off all the way to 300s.
+        assert_eq!(step(&mut actor, 500, 200), (None, Duration::from_secs(30)));
+        assert_eq!(actor.candidate, None);
+        assert_eq!(step(&mut actor, 30_000, 22_000), (None, Duration::from_secs(60)));
+        assert_eq!(actor.candidate, None);
+        // 60ms vs 49ms: 11ms >= 10ms, but < 20% faster (`49 * 5 >= 60 * 4`), still no candidate.
+        assert_eq!(step(&mut actor, 60_000, 49_000), (None, Duration::from_secs(120)));
+        assert_eq!(actor.candidate, None);
+        assert_eq!(step(&mut actor, 400, 150), (None, Duration::from_secs(240)));
+        assert_eq!(step(&mut actor, 30_000, 21_000), (None, Duration::from_secs(300)));
+        assert_eq!(step(&mut actor, 30_000, 21_000), (None, Duration::from_secs(300)));
+
+        // Both satisfied (30ms vs 19ms: 11ms >= 10ms and >20% faster): candidate on round 1 resets sleep to 30s,
+        // round 2 confirms switch.
+        assert_eq!(step(&mut actor, 30_000, 19_000), (None, Duration::from_secs(30)));
+        assert_eq!(actor.candidate, Some((entry.clone(), 1)));
+        assert_eq!(step(&mut actor, 30_000, 19_000), (Some(entry), Duration::from_secs(30)));
+        assert_eq!(actor.candidate, None);
     }
 }

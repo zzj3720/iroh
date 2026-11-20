@@ -44,5 +44,7 @@ Alternate relay-entrance probes (`ActiveRelayActor::start_entry_probes`) back of
 (`30 -> 60 -> 120 -> 240 -> 300` s) whenever a round finds no candidate and none is being observed. Observing a
 candidate, switching entrances, updating `entries`, reconnecting after a failure, or receiving a major network-change
 connection check (`ActiveRelayMessage::CheckConnection`) resets the interval to 30 s; connection failures and major
-network changes also wake an immediate probe round. Probes keep ephemeral identities, the 20% / two-round handover
-hysteresis, and the configured `[url, ...entries]` ceiling.
+network changes also wake an immediate probe round. Probes keep ephemeral identities, require an alternate entrance to
+beat the current one by both 20% and at least 10 ms (`ENTRY_MIN_GAIN`) across the two-round handover hysteresis so
+loopback or scheduling jitter cannot reset backoff or churn sockets, and stay within the configured `[url, ...entries]`
+ceiling.

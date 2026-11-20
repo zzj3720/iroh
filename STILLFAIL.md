@@ -39,3 +39,10 @@ are unaffected, and noq retains its last-open-path guard.
 Custom selectors can compare `PathSelectionData::connection()` weak identities together
 with noq's path generation, same-path RTT epoch and actual ACK sample sequence. Snapshot
 reads and initial PATH_RESPONSE estimates are not sustained quality evidence.
+
+Alternate relay-entrance probes (`ActiveRelayActor::start_entry_probes`) back off exponentially from 30 s up to 5 min
+(`30 -> 60 -> 120 -> 240 -> 300` s) whenever a round finds no candidate and none is being observed. Observing a
+candidate, switching entrances, updating `entries`, reconnecting after a failure, or receiving a major network-change
+connection check (`ActiveRelayMessage::CheckConnection`) resets the interval to 30 s; connection failures and major
+network changes also wake an immediate probe round. Probes keep ephemeral identities, the 20% / two-round handover
+hysteresis, and the configured `[url, ...entries]` ceiling.

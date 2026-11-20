@@ -52,9 +52,7 @@ use n0_future::{
 };
 use n0_watcher::Watchable;
 use netwatch::interfaces;
-use tokio::sync::mpsc;
-#[cfg(test)]
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, debug, error, event, info, info_span, instrument, trace, warn};
 use url::Url;
@@ -95,6 +93,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Recheck alternate entrances to one relay without registering the endpoint's key on it twice.
 const ENTRY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// ember: ceiling for adaptive entry-probe backoff while the current entrance stays optimal.
+const ENTRY_PROBE_INTERVAL_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// ember: how long closing a relay connection gracefully may take; a dead one would otherwise hold its actor.
 const CLIENT_SINK_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -161,7 +162,13 @@ struct ActiveRelayActor {
     candidate: Option<(RelayUrl, u8)>,
     has_compared: bool,
     last_samples: Vec<(RelayUrl, Duration)>,
-    probe_now: Arc<tokio::sync::Notify>,
+    /// ember: sleep duration after the next stable entry-probe round (`ENTRY_PROBE_INTERVAL`..=`ENTRY_PROBE_INTERVAL_MAX`).
+    probe_interval: Duration,
+    /// ember: bumped on `update_entries` so stale samples from an aborted probe loop are ignored.
+    entries_gen: u64,
+    /// ember: bumped and broadcast to wake the entry-probe loop immediately (`trigger_probe_now`).
+    probe_epoch: u64,
+    probe_now_tx: watch::Sender<u64>,
     _entry_probes: Option<AbortOnDropHandle<()>>,
     /// ember: whether the relay's UDP way is asked for, read at each dial.
     udp: Arc<AtomicBool>,
@@ -196,7 +203,7 @@ enum ActiveRelayMessage {
     /// Sets this relay as the home relay, or not.
     SetHomeRelay(bool),
     /// Recent round trips to this relay over each of its possible entrances.
-    EntrySamples(Vec<(RelayUrl, Duration)>),
+    EntrySamples(Vec<(RelayUrl, Duration)>, Option<EntryProbeRound>),
     /// Entrances changed while the relay connection is already running.
     UpdateEntries(Vec<RelayUrl>, mpsc::Sender<ActiveRelayMessage>),
     /// ember: the link dialed again (`Endpoint::set_relay_udp`); none is dialed while not connected.
@@ -299,6 +306,15 @@ enum DialError {
     Connect { source: ConnectError },
 }
 
+/// ember: round metadata and next-delay reply channel for [`ActiveRelayActor::start_entry_probes`], keeping all
+/// adaptive-backoff state inside [`ActiveRelayActor`].
+#[derive(Debug)]
+struct EntryProbeRound {
+    entries_gen: u64,
+    round_epoch: u64,
+    delay_tx: oneshot::Sender<Duration>,
+}
+
 impl ActiveRelayActor {
     fn new(opts: ActiveRelayActorOptions) -> Self {
         let ActiveRelayActorOptions {
@@ -315,6 +331,7 @@ impl ActiveRelayActor {
         } = opts;
         let udp = connection_opts.udp.clone();
         let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts.clone());
+        let (probe_now_tx, _probe_now_rx) = watch::channel(0u64);
         ActiveRelayActor {
             endpoints_present,
             inbox,
@@ -328,7 +345,10 @@ impl ActiveRelayActor {
             candidate: None,
             has_compared: false,
             last_samples: Vec::new(),
-            probe_now: Arc::new(tokio::sync::Notify::new()),
+            probe_interval: ENTRY_PROBE_INTERVAL,
+            entries_gen: 0,
+            probe_epoch: 0,
+            probe_now_tx,
             _entry_probes: None,
             udp,
             is_home_relay: false,
@@ -387,9 +407,11 @@ impl ActiveRelayActor {
             }
         }
         let opts = self.connection_opts.clone();
-        let probe_now = self.probe_now.clone();
+        let entries_gen = self.entries_gen;
+        let mut probe_now_rx = self.probe_now_tx.subscribe();
         self._entry_probes = Some(AbortOnDropHandle::new(task::spawn(async move {
             loop {
+                let round_epoch = *probe_now_rx.borrow_and_update();
                 let attempts = urls.iter().cloned().map(|url| {
                     let opts = opts.clone();
                     async move { Self::probe_entry(url, opts).await }
@@ -401,16 +423,29 @@ impl ActiveRelayActor {
                         samples.push(sample);
                     }
                 }
+                let (delay_tx, delay_rx) = oneshot::channel();
+                let round = EntryProbeRound {
+                    entries_gen,
+                    round_epoch,
+                    delay_tx,
+                };
                 if sender
-                    .send(ActiveRelayMessage::EntrySamples(samples))
+                    .send(ActiveRelayMessage::EntrySamples(samples, Some(round)))
                     .await
                     .is_err()
                 {
                     break;
                 }
+                let Ok(delay) = delay_rx.await else {
+                    break;
+                };
                 tokio::select! {
-                    _ = time::sleep(ENTRY_PROBE_INTERVAL) => {},
-                    _ = probe_now.notified() => {},
+                    _ = time::sleep(delay) => {},
+                    res = probe_now_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         })));
@@ -495,6 +530,58 @@ impl ActiveRelayActor {
         self.access = access;
     }
 
+    /// ember: wakes the entrance-probe loop immediately and resets its backoff interval to `ENTRY_PROBE_INTERVAL`.
+    fn trigger_probe_now(&mut self) {
+        self.probe_interval = ENTRY_PROBE_INTERVAL;
+        self.probe_epoch = self.probe_epoch.wrapping_add(1);
+        self.probe_now_tx.send_replace(self.probe_epoch);
+    }
+
+    /// ember: applies one round of entrance probe samples and answers how long the probe loop should sleep next.
+    ///
+    /// Stale samples from a loop replaced by `update_entries` are ignored. When no candidate is under observation and
+    /// no entrance switch occurs, the sleep doubles up to `ENTRY_PROBE_INTERVAL_MAX`; any candidate, switch,
+    /// `update_entries`, or `trigger_probe_now` resets the interval to `ENTRY_PROBE_INTERVAL`.
+    fn on_entry_samples(
+        &mut self,
+        samples: Vec<(RelayUrl, Duration)>,
+        round: Option<EntryProbeRound>,
+        allow_choose: bool,
+    ) -> Option<RelayUrl> {
+        if let Some(ref r) = round
+            && r.entries_gen != self.entries_gen
+        {
+            return None;
+        }
+        self.last_samples = samples.clone();
+        let chosen = if allow_choose {
+            self.choose_entry(&samples)
+        } else {
+            None
+        };
+        let reset = !allow_choose
+            || chosen.is_some()
+            || self.candidate.is_some()
+            || round
+                .as_ref()
+                .is_some_and(|r| r.round_epoch != self.probe_epoch);
+        let delay = if reset {
+            self.probe_interval = ENTRY_PROBE_INTERVAL;
+            ENTRY_PROBE_INTERVAL
+        } else {
+            let delay = self.probe_interval;
+            self.probe_interval = self
+                .probe_interval
+                .saturating_mul(2)
+                .min(ENTRY_PROBE_INTERVAL_MAX);
+            delay
+        };
+        if let Some(r) = round {
+            let _ = r.delay_tx.send(delay);
+        }
+        chosen
+    }
+
     fn update_entries(
         &mut self,
         entries: Vec<RelayUrl>,
@@ -503,6 +590,8 @@ impl ActiveRelayActor {
         self.entries = entries;
         self.candidate = None;
         self.has_compared = false;
+        self.probe_interval = ENTRY_PROBE_INTERVAL;
+        self.entries_gen = self.entries_gen.wrapping_add(1);
         self.last_samples
             .retain(|(url, _)| *url == self.url || self.entries.contains(url));
         self.start_entry_probes(sender);
@@ -537,7 +626,7 @@ impl ActiveRelayActor {
             if let Some(access) = alternate {
                 self.set_access(access);
             }
-            self.probe_now.notify_one();
+            self.trigger_probe_now();
             if !was_established {
                 // If dialing failed, or if the relay connection failed before we received a pong,
                 // we wait an exponentially increasing time until we attempt to reconnect again.
@@ -581,9 +670,8 @@ impl ActiveRelayActor {
                         ActiveRelayMessage::SetHomeRelay(is_home) => {
                             self.set_home_relay(is_home);
                         }
-                        ActiveRelayMessage::EntrySamples(samples) => {
-                            self.last_samples = samples.clone();
-                            if let Some(access) = self.choose_entry(&samples) {
+                        ActiveRelayMessage::EntrySamples(samples, round) => {
+                            if let Some(access) = self.on_entry_samples(samples, round, true) {
                                 self.set_access(access);
                             }
                         }
@@ -592,7 +680,11 @@ impl ActiveRelayActor {
                                 self.set_access(self.url.clone());
                             }
                         }
-                        ActiveRelayMessage::CheckConnection { .. } | ActiveRelayMessage::Reconnect => {}
+                        ActiveRelayMessage::CheckConnection { .. } => {
+                            // ember: major network change triggers an immediate entrance probe and resets backoff.
+                            self.trigger_probe_now();
+                        }
+                        ActiveRelayMessage::Reconnect => {}
                         #[cfg(test)]
                         ActiveRelayMessage::GetLocalAddr(sender) => {
                             sender.send(None).ok();
@@ -710,9 +802,8 @@ impl ActiveRelayActor {
                         ActiveRelayMessage::SetHomeRelay(is_home) => {
                             self.set_home_relay(is_home);
                         }
-                        ActiveRelayMessage::EntrySamples(samples) => {
-                            self.last_samples = samples.clone();
-                            if let Some(access) = self.choose_entry(&samples) {
+                        ActiveRelayMessage::EntrySamples(samples, round) => {
+                            if let Some(access) = self.on_entry_samples(samples, round, true) {
                                 self.set_access(access);
                                 dialing_fut.set(self.dial_relay());
                             }
@@ -723,7 +814,11 @@ impl ActiveRelayActor {
                                 dialing_fut.set(self.dial_relay());
                             }
                         }
-                        ActiveRelayMessage::CheckConnection { .. } | ActiveRelayMessage::Reconnect => {}
+                        ActiveRelayMessage::CheckConnection { .. } => {
+                            // ember: major network change triggers an immediate entrance probe and resets backoff.
+                            self.trigger_probe_now();
+                        }
+                        ActiveRelayMessage::Reconnect => {}
                         #[cfg(test)]
                         ActiveRelayMessage::GetLocalAddr(sender) => {
                             sender.send(None).ok();
@@ -877,13 +972,15 @@ impl ActiveRelayActor {
                                 );
                             }
                         }
-                        ActiveRelayMessage::EntrySamples(samples) => {
-                            self.last_samples = samples.clone();
-                            if replacement.is_none() {
-                                if let Some(access) = self.choose_entry(&samples) {
-                                    replacement.as_mut().set_future(self.dial_entry(access.clone()));
-                                    replacement_access = Some(access);
-                                }
+                        ActiveRelayMessage::EntrySamples(samples, round) => {
+                            let allow_choose = replacement.is_none();
+                            if let Some(access) =
+                                self.on_entry_samples(samples, round, allow_choose)
+                            {
+                                replacement
+                                    .as_mut()
+                                    .set_future(self.dial_entry(access.clone()));
+                                replacement_access = Some(access);
                             }
                         }
                         ActiveRelayMessage::UpdateEntries(entries, sender) => {
@@ -902,6 +999,9 @@ impl ActiveRelayActor {
                         ActiveRelayMessage::CheckConnection { local_ips } => {
                             match client_stream.local_addr() {
                                 Some(addr) if local_ips.contains(&addr.ip()) => {
+                                    // ember: major network change keeps this socket when its local IP is still valid,
+                                    // so notify `probe_now` here as well (`Err` branches reach `run` -> `trigger_probe_now`).
+                                    self.trigger_probe_now();
                                     let data = state.ping_tracker.new_ping();
                                     let fut = client_sink.send(ClientToRelayMsg::Ping(data));
                                     self.run_sending(fut, &mut state, &mut client_stream).await?;
@@ -929,6 +1029,7 @@ impl ActiveRelayActor {
                     match result {
                         Ok(client) => {
                             self.set_access(replacement_access.take().expect("entry dial has an address"));
+                            self.probe_interval = ENTRY_PROBE_INTERVAL;
                             break Ok(Some(client));
                         }
                         Err(err) => {
@@ -2240,10 +2341,13 @@ mod tests {
         send_recv_echo(packet.clone(), &send_tx, &mut recv_rx).await?;
         let mut updates = watch.watch();
         inbox_tx
-            .send(ActiveRelayMessage::EntrySamples(vec![
-                (relay.clone(), Duration::from_millis(200)),
-                (entry.clone(), Duration::from_millis(20)),
-            ]))
+            .send(ActiveRelayMessage::EntrySamples(
+                vec![
+                    (relay.clone(), Duration::from_millis(200)),
+                    (entry.clone(), Duration::from_millis(20)),
+                ],
+                None,
+            ))
             .await
             .std_context("send entry measurements")?;
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -2258,10 +2362,13 @@ mod tests {
         }
         for _ in 0..2 {
             inbox_tx
-                .send(ActiveRelayMessage::EntrySamples(vec![
-                    (relay.clone(), Duration::from_millis(20)),
-                    (entry.clone(), Duration::from_millis(200)),
-                ]))
+                .send(ActiveRelayMessage::EntrySamples(
+                    vec![
+                        (relay.clone(), Duration::from_millis(20)),
+                        (entry.clone(), Duration::from_millis(200)),
+                    ],
+                    None,
+                ))
                 .await
                 .std_context("send direct measurements")?;
         }
@@ -3045,5 +3152,650 @@ mod tests {
         watch.set_same_endpoint_id_connected(&a, true);
         watch.set_status(&a, RelayConnectionState::Disconnected { last_error: None });
         assert!(!watch.get().unwrap().same_endpoint_id_connected());
+    }
+
+    struct CountingEntrance {
+        url: RelayUrl,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        changed: Arc<tokio::sync::Notify>,
+        _task: AbortOnDropHandle<()>,
+    }
+
+    impl CountingEntrance {
+        async fn bind(target: String, initial_delay_ms: u64) -> Result<Self> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .std_context("bind counting entrance")?;
+            let url: RelayUrl = format!(
+                "https://{}",
+                listener.local_addr().std_context("entrance addr")?
+            )
+            .parse()
+            .std_context("entrance url")?;
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(initial_delay_ms));
+            let changed = Arc::new(tokio::sync::Notify::new());
+            let accepted_task = accepted.clone();
+            let closed_task = closed.clone();
+            let delay_task = delay_ms.clone();
+            let changed_task = changed.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((incoming, _)) = listener.accept().await {
+                    accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    changed_task.notify_waiters();
+                    let target = target.clone();
+                    let closed = closed_task.clone();
+                    let delay_ms = delay_task.clone();
+                    let changed = changed_task.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        if let Ok(upstream) = tokio::net::TcpStream::connect(target).await {
+                            let (mut in_r, mut in_w) = incoming.into_split();
+                            let (mut up_r, mut up_w) = upstream.into_split();
+                            let c2s = async {
+                                let mut buf = [0u8; 8192];
+                                loop {
+                                    let Ok(n) = in_r.read(&mut buf).await else {
+                                        break;
+                                    };
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    let d = delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+                                    if d > 0 {
+                                        tokio::time::sleep(Duration::from_millis(d)).await;
+                                    }
+                                    if up_w.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                let _ = up_w.shutdown().await;
+                            };
+                            let s2c = async {
+                                let _ = tokio::io::copy(&mut up_r, &mut in_w).await;
+                                let _ = in_w.shutdown().await;
+                            };
+                            tokio::join!(c2s, s2c);
+                        }
+                        closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        changed.notify_waiters();
+                    });
+                }
+            });
+            Ok(Self {
+                url,
+                accepted,
+                closed,
+                delay_ms,
+                changed,
+                _task: AbortOnDropHandle::new(task),
+            })
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn closed(&self) -> usize {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_delay_ms(&self, ms: u64) {
+            self.delay_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    async fn wait_for_cond<F: Fn() -> bool>(
+        notify: &tokio::sync::Notify,
+        cond: F,
+        what: &'static str,
+    ) -> Result {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let fut = notify.notified();
+                tokio::pin!(fut);
+                fut.as_mut().enable();
+                if cond() {
+                    break;
+                }
+                fut.await;
+            }
+        })
+        .await
+        .std_context(what)
+    }
+
+    fn start_home_echo_endpoint(relay_url: RelayUrl) -> (EndpointId, AbortOnDropHandle<()>) {
+        let secret_key = SecretKey::from_bytes(&[8u8; 32]);
+        let (recv_datagram_tx, mut recv_datagram_rx) = mpsc::channel(16);
+        let (send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
+        let (inbox_tx, inbox_rx) = mpsc::channel(16);
+        inbox_tx
+            .try_send(ActiveRelayMessage::SetHomeRelay(true))
+            .expect("inbox open");
+        let cancel_token = CancellationToken::new();
+        let actor_task = start_active_relay_actor(
+            secret_key.clone(),
+            cancel_token.clone(),
+            relay_url.clone(),
+            inbox_rx,
+            send_datagram_rx,
+            recv_datagram_tx,
+            info_span!("home-echo-endpoint"),
+        );
+        let echo_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(recv) = recv_datagram_rx.recv().await {
+                let send = RelaySendItem {
+                    remote_endpoint: recv.src,
+                    url: relay_url.clone(),
+                    datagrams: recv.datagrams,
+                    queued: None,
+                };
+                send_datagram_tx.send(send).await.ok();
+            }
+        }));
+        let supervisor = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _guard = cancel_token.drop_guard();
+            let _inbox_tx = inbox_tx;
+            tokio::select! {
+                biased;
+                _ = actor_task => (),
+                _ = echo_task => (),
+            }
+        }));
+        (secret_key.public(), supervisor)
+    }
+
+    struct EntryProbeRig {
+        _server: iroh_relay::server::Server,
+        target: String,
+        peer: EndpointId,
+        _echo: AbortOnDropHandle<()>,
+        relay: CountingEntrance,
+        entry: CountingEntrance,
+        inbox_tx: mpsc::Sender<ActiveRelayMessage>,
+        send_tx: mpsc::Sender<RelaySendItem>,
+        recv_rx: mpsc::Receiver<RelayRecvDatagram>,
+        watch: HomeRelayWatch,
+        cancel: CancellationToken,
+        _actor: AbortOnDropHandle<()>,
+    }
+
+    impl EntryProbeRig {
+        async fn start(relay_delay_ms: u64, entry_delay_ms: u64) -> Result<Self> {
+            let (_map, upstream_relay, server) = test_utils::run_relay_server().await?;
+            let (peer, echo) = start_home_echo_endpoint(upstream_relay.clone());
+            let target = format!(
+                "{}:{}",
+                upstream_relay.host_str().unwrap(),
+                upstream_relay.port_or_known_default().unwrap()
+            );
+            let relay = CountingEntrance::bind(target.clone(), relay_delay_ms).await?;
+            let entry = CountingEntrance::bind(target.clone(), entry_delay_ms).await?;
+            let (recv_tx, recv_rx) = mpsc::channel(64);
+            let (send_tx, send_rx) = mpsc::channel(64);
+            let (inbox_tx, inbox_rx) = mpsc::channel(64);
+            let watch = HomeRelayWatch::default();
+            watch.set(relay.url.clone(), RelayConnectionState::Connecting);
+            let cancel = CancellationToken::new();
+            let opts = ActiveRelayActorOptions {
+                url: relay.url.clone(),
+                entries: vec![entry.url.clone()],
+                endpoints_present: Default::default(),
+                inbox: inbox_rx,
+                relay_datagrams_send: send_rx,
+                relay_datagrams_recv: recv_tx,
+                connection_opts: RelayConnectionOptions {
+                    secret_key: SecretKey::generate(),
+                    dns_resolver: DnsResolver::new(),
+                    proxy_url: None,
+                    prefer_ipv6: Arc::new(AtomicBool::new(false)),
+                    tls_config: CaTlsConfig::insecure_skip_verify()
+                        .client_config(default_provider())
+                        .expect("infallible"),
+                    auth_token: None,
+                    udp: Default::default(),
+                },
+                stop_token: cancel.clone(),
+                metrics: Default::default(),
+                my_relay: watch.clone(),
+            };
+            inbox_tx
+                .send(ActiveRelayMessage::SetHomeRelay(true))
+                .await
+                .std_context("set home relay")?;
+            let mut actor = ActiveRelayActor::new(opts);
+            actor.start_entry_probes(inbox_tx.clone());
+            let actor_task = AbortOnDropHandle::new(tokio::spawn(
+                actor.run().instrument(info_span!("entry-probe-rig")),
+            ));
+            let mut updates = watch.watch();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !updates.get().as_ref().is_some_and(|s| s.is_connected()) {
+                    updates.updated().await.expect("watch open");
+                }
+            })
+            .await
+            .std_context("initial relay connected")?;
+            // Wait for initial probe round (t = 0): 1 formal + 1 probe on relay (1 closed), 1 probe on entry (1 closed).
+            wait_for_cond(
+                &relay.changed,
+                || relay.accepted() == 2 && relay.closed() == 1,
+                "initial relay probe",
+            )
+            .await?;
+            wait_for_cond(
+                &entry.changed,
+                || entry.accepted() == 1 && entry.closed() == 1,
+                "initial entry probe",
+            )
+            .await?;
+            let rig = Self {
+                _server: server,
+                target,
+                peer,
+                _echo: echo,
+                relay,
+                entry,
+                inbox_tx,
+                send_tx,
+                recv_rx,
+                watch,
+                cancel,
+                _actor: actor_task,
+            };
+            rig.sync_actor().await?;
+            Ok(rig)
+        }
+
+        async fn sync_actor(&self) -> Result {
+            for _ in 0..2 {
+                let (tx, rx) = oneshot::channel();
+                self.inbox_tx
+                    .send(ActiveRelayMessage::PingServer(tx))
+                    .await
+                    .std_context("send ping server")?;
+                tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .std_context("ping server timeout")?
+                    .std_context("ping server dropped")?;
+            }
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        }
+
+        async fn advance_clock(dt: Duration) {
+            tokio::time::pause();
+            tokio::time::advance(dt).await;
+            tokio::time::resume();
+            tokio::task::yield_now().await;
+        }
+
+        async fn assert_silent_for(&self, dt: Duration, ctx: &str) -> Result {
+            let r0 = self.relay.accepted();
+            let e0 = self.entry.accepted();
+            Self::advance_clock(dt).await;
+            self.sync_actor().await?;
+            assert_eq!(
+                (self.relay.accepted() - r0, self.entry.accepted() - e0),
+                (0, 0),
+                "unexpected probe connections during {ctx}"
+            );
+            Ok(())
+        }
+
+        async fn advance_expect_round(&self, dt: Duration, ctx: &str) -> Result {
+            let (r_acc, r_cls) = (self.relay.accepted(), self.relay.closed());
+            let (e_acc, e_cls) = (self.entry.accepted(), self.entry.closed());
+            Self::advance_clock(dt).await;
+            wait_for_cond(
+                &self.relay.changed,
+                || self.relay.accepted() == r_acc + 1 && self.relay.closed() == r_cls + 1,
+                "relay probe round",
+            )
+            .await
+            .std_context(ctx)?;
+            wait_for_cond(
+                &self.entry.changed,
+                || self.entry.accepted() == e_acc + 1 && self.entry.closed() == e_cls + 1,
+                "entry probe round",
+            )
+            .await
+            .std_context(ctx)?;
+            self.sync_actor().await?;
+            assert_eq!(
+                (self.relay.accepted() - r_acc, self.entry.accepted() - e_acc),
+                (1, 1),
+                "expected exactly 2 probe connections (1 relay + 1 entry) at {ctx}"
+            );
+            Ok(())
+        }
+
+        async fn back_off_to_max(&self) -> Result {
+            for (gap_secs, total_secs) in [(30u64, 30u64), (60, 90), (120, 210), (240, 450)] {
+                self.assert_silent_for(
+                    Duration::from_secs(gap_secs - 2),
+                    &format!("before {total_secs}s"),
+                )
+                .await?;
+                self.advance_expect_round(Duration::from_secs(2), &format!("t={total_secs}s"))
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn entry_probe_backoff_schedule() -> Result {
+        // Make `relay` consistently faster than `entry` so no candidate is ever observed.
+        let rig = EntryProbeRig::start(0, 25).await?;
+        // Round 0 already ran at t = 0s with 2 probe connections (1 relay + 1 entry).
+        assert_eq!((rig.relay.accepted(), rig.entry.accepted()), (2, 1));
+
+        // Expected rounds at t = 30, 90, 210, 450, 750, 1050 s (intervals: 30 -> 60 -> 120 -> 240 -> 300 -> 300).
+        for (gap_secs, total_secs) in [
+            (30u64, 30u64),
+            (60, 90),
+            (120, 210),
+            (240, 450),
+            (300, 750),
+            (300, 1050),
+        ] {
+            rig.assert_silent_for(
+                Duration::from_secs(gap_secs - 2),
+                &format!("t={}s (before {total_secs}s)", total_secs - 2),
+            )
+            .await?;
+            rig.advance_expect_round(Duration::from_secs(2), &format!("t={total_secs}s"))
+                .await?;
+        }
+        // 1 formal connection + 7 probe rounds * 2 connections = 15 total (8 on relay, 7 on entry).
+        assert_eq!((rig.relay.accepted(), rig.entry.accepted()), (8, 7));
+        rig.cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn entry_probe_now_resets_backoff() -> Result {
+        let rig = EntryProbeRig::start(0, 25).await?;
+        rig.back_off_to_max().await?;
+
+        // Backed off to 300s after t = 450s; advance +50s to t = 500s (no probe yet).
+        rig.assert_silent_for(Duration::from_secs(50), "t=500s while backed off to 300s")
+            .await?;
+
+        // 1) Major network change (`CheckConnection` with valid local IP): probes immediately and resets interval to 30s.
+        let (tx, rx) = oneshot::channel();
+        rig.inbox_tx
+            .send(ActiveRelayMessage::GetLocalAddr(tx))
+            .await
+            .std_context("get local addr")?;
+        let local_ip = rx
+            .await
+            .std_context("recv local addr")?
+            .context("missing local addr")?
+            .ip();
+        let (r_acc, r_cls) = (rig.relay.accepted(), rig.relay.closed());
+        let (e_acc, e_cls) = (rig.entry.accepted(), rig.entry.closed());
+        rig.inbox_tx
+            .send(ActiveRelayMessage::CheckConnection {
+                local_ips: vec![local_ip],
+            })
+            .await
+            .std_context("send major network change CheckConnection")?;
+        wait_for_cond(
+            &rig.relay.changed,
+            || rig.relay.accepted() == r_acc + 1 && rig.relay.closed() == r_cls + 1,
+            "immediate relay probe on network change",
+        )
+        .await?;
+        wait_for_cond(
+            &rig.entry.changed,
+            || rig.entry.accepted() == e_acc + 1 && rig.entry.closed() == e_cls + 1,
+            "immediate entry probe on network change",
+        )
+        .await?;
+        rig.sync_actor().await?;
+
+        // Next round is back to 30s (t = 530s), then doubles to 60s (t = 590s).
+        rig.assert_silent_for(Duration::from_secs(28), "before t=530s after probe_now")
+            .await?;
+        rig.advance_expect_round(Duration::from_secs(2), "t=530s (30s after probe_now)")
+            .await?;
+        rig.assert_silent_for(Duration::from_secs(58), "before t=590s")
+            .await?;
+        rig.advance_expect_round(Duration::from_secs(2), "t=590s")
+            .await?;
+
+        // Back off to 300s again (590 + 120 = 710, + 240 = 950 -> next interval is 300s).
+        for (gap_secs, label) in [(120u64, "t=710s"), (240, "t=950s")] {
+            rig.assert_silent_for(Duration::from_secs(gap_secs - 2), label)
+                .await?;
+            rig.advance_expect_round(Duration::from_secs(2), label)
+                .await?;
+        }
+        rig.assert_silent_for(Duration::from_secs(50), "t=1000s while backed off to 300s")
+            .await?;
+
+        // 2) Connection failure (`CheckConnection` with empty local_ips forces reconnect -> `run` switches to the
+        // measured alternate `entry` and notifies `probe_now`): immediate probe round runs and interval resets to 30s.
+        rig.relay.set_delay_ms(25);
+        rig.entry.set_delay_ms(0);
+        let (r_acc, r_cls) = (rig.relay.accepted(), rig.relay.closed());
+        let (e_acc, e_cls) = (rig.entry.accepted(), rig.entry.closed());
+        rig.inbox_tx
+            .send(ActiveRelayMessage::CheckConnection {
+                local_ips: Vec::new(),
+            })
+            .await
+            .std_context("force reconnect")?;
+        wait_for_cond(
+            &rig.relay.changed,
+            || rig.relay.accepted() == r_acc + 1 && rig.relay.closed() == r_cls + 2,
+            "old relay closed + immediate relay probe",
+        )
+        .await?;
+        wait_for_cond(
+            &rig.entry.changed,
+            || rig.entry.accepted() == e_acc + 2 && rig.entry.closed() == e_cls + 1,
+            "alternate reconnect + immediate entry probe",
+        )
+        .await?;
+        rig.sync_actor().await?;
+        rig.assert_silent_for(Duration::from_secs(28), "before t=1030s after reconnect")
+            .await?;
+        rig.advance_expect_round(Duration::from_secs(2), "t=1030s (30s after reconnect)")
+            .await?;
+        rig.assert_silent_for(Duration::from_secs(58), "before t=1090s")
+            .await?;
+        rig.advance_expect_round(Duration::from_secs(2), "t=1090s")
+            .await?;
+
+        rig.cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn entry_probe_switches_within_two_30s_rounds_after_backoff() -> Result {
+        let mut rig = EntryProbeRig::start(0, 40).await?;
+        let packet = RelaySendItem {
+            remote_endpoint: rig.peer,
+            url: rig.relay.url.clone(),
+            datagrams: Datagrams::from(b"echo over active entrance"),
+            queued: None,
+        };
+
+        // Back off to 300s (t = 450s) while `relay` stays optimal.
+        rig.back_off_to_max().await?;
+        send_recv_echo(packet.clone(), &rig.send_tx, &mut rig.recv_rx).await?;
+        assert_eq!(
+            rig.watch.get().as_ref().map(|s| s.access_url()),
+            Some(&rig.relay.url)
+        );
+
+        // Now `entry` becomes >20% faster than `relay`.
+        rig.relay.set_delay_ms(40);
+        rig.entry.set_delay_ms(0);
+
+        // First round after backoff fires at t = 750s (+300s): observes `entry` as candidate (count = 1),
+        // does NOT switch yet, and resets interval from 300s back to 30s.
+        rig.assert_silent_for(Duration::from_secs(298), "before t=750s")
+            .await?;
+        rig.advance_expect_round(Duration::from_secs(2), "t=750s candidate round 1")
+            .await?;
+        assert_eq!(
+            rig.watch.get().as_ref().map(|s| s.access_url()),
+            Some(&rig.relay.url),
+            "must require two consecutive rounds before switching"
+        );
+
+        // Second round fires 30s later at t = 780s (not 300s!): confirms candidate (count = 2) and switches to `entry`.
+        rig.assert_silent_for(Duration::from_secs(28), "before t=780s candidate round 2")
+            .await?;
+        let mut updates = rig.watch.watch();
+        let (r_acc, r_cls) = (rig.relay.accepted(), rig.relay.closed());
+        let (e_acc, e_cls) = (rig.entry.accepted(), rig.entry.closed());
+        EntryProbeRig::advance_clock(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while updates.get().as_ref().map(|s| s.access_url()) != Some(&rig.entry.url) {
+                updates.updated().await.expect("watch open");
+            }
+        })
+        .await
+        .std_context("switched to faster entry on second 30s round")?;
+        // Wait for the probe connections of t=780s and superseded `relay` socket to close (`entry` keeps +1 formal).
+        wait_for_cond(
+            &rig.relay.changed,
+            || rig.relay.accepted() == r_acc + 1 && rig.relay.closed() == r_cls + 2,
+            "relay probe + old socket closed at t=780s",
+        )
+        .await?;
+        wait_for_cond(
+            &rig.entry.changed,
+            || rig.entry.accepted() == e_acc + 2 && rig.entry.closed() == e_cls + 1,
+            "entry probe closed + handover dial open at t=780s",
+        )
+        .await?;
+        rig.sync_actor().await?;
+        send_recv_echo(packet, &rig.send_tx, &mut rig.recv_rx).await?;
+
+        // Interval after switch is reset to 30s (next round at t = 810s).
+        rig.assert_silent_for(Duration::from_secs(28), "before t=810s after switch")
+            .await?;
+        rig.advance_expect_round(Duration::from_secs(2), "t=810s after switch")
+            .await?;
+
+        rig.cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn entry_probe_update_entries_resets_backoff() -> Result {
+        let rig = EntryProbeRig::start(0, 25).await?;
+        rig.back_off_to_max().await?;
+        rig.assert_silent_for(Duration::from_secs(50), "t=500s while backed off to 300s")
+            .await?;
+
+        let entry2 = CountingEntrance::bind(rig.target.clone(), 35).await?;
+        let (r_acc, r_cls) = (rig.relay.accepted(), rig.relay.closed());
+        let (e1_acc, e1_cls) = (rig.entry.accepted(), rig.entry.closed());
+
+        rig.inbox_tx
+            .send(ActiveRelayMessage::UpdateEntries(
+                vec![rig.entry.url.clone(), entry2.url.clone()],
+                rig.inbox_tx.clone(),
+            ))
+            .await
+            .std_context("send UpdateEntries")?;
+
+        // `update_entries` restarts probes immediately (1 connection on each of relay, entry, entry2)
+        // and resets the interval back to 30s.
+        wait_for_cond(
+            &rig.relay.changed,
+            || rig.relay.accepted() == r_acc + 1 && rig.relay.closed() == r_cls + 1,
+            "immediate relay probe on update_entries",
+        )
+        .await?;
+        wait_for_cond(
+            &rig.entry.changed,
+            || rig.entry.accepted() == e1_acc + 1 && rig.entry.closed() == e1_cls + 1,
+            "immediate entry1 probe on update_entries",
+        )
+        .await?;
+        wait_for_cond(
+            &entry2.changed,
+            || entry2.accepted() == 1 && entry2.closed() == 1,
+            "immediate entry2 probe on update_entries",
+        )
+        .await?;
+        rig.sync_actor().await?;
+
+        // Next round occurs 30s later (t = 530s), not 300s later.
+        let (r0, e1_0, e2_0) = (rig.relay.accepted(), rig.entry.accepted(), entry2.accepted());
+        EntryProbeRig::advance_clock(Duration::from_secs(28)).await;
+        rig.sync_actor().await?;
+        assert_eq!(
+            (
+                rig.relay.accepted() - r0,
+                rig.entry.accepted() - e1_0,
+                entry2.accepted() - e2_0,
+            ),
+            (0, 0, 0),
+            "silent for 28s after update_entries"
+        );
+
+        EntryProbeRig::advance_clock(Duration::from_secs(2)).await;
+        wait_for_cond(
+            &entry2.changed,
+            || entry2.accepted() == e2_0 + 1 && entry2.closed() == 2,
+            "entry2 probe 30s after update_entries",
+        )
+        .await?;
+        wait_for_cond(
+            &rig.relay.changed,
+            || rig.relay.accepted() == r0 + 1,
+            "relay probe 30s after update_entries",
+        )
+        .await?;
+        wait_for_cond(
+            &rig.entry.changed,
+            || rig.entry.accepted() == e1_0 + 1,
+            "entry1 probe 30s after update_entries",
+        )
+        .await?;
+        rig.sync_actor().await?;
+
+        // And then backs off to 60s again (silent at +58s, fires at +60s).
+        let (r1, e1_1, e2_1) = (rig.relay.accepted(), rig.entry.accepted(), entry2.accepted());
+        EntryProbeRig::advance_clock(Duration::from_secs(58)).await;
+        rig.sync_actor().await?;
+        assert_eq!(
+            (
+                rig.relay.accepted() - r1,
+                rig.entry.accepted() - e1_1,
+                entry2.accepted() - e2_1,
+            ),
+            (0, 0, 0),
+            "silent for 58s on second round after update_entries"
+        );
+        EntryProbeRig::advance_clock(Duration::from_secs(2)).await;
+        wait_for_cond(
+            &entry2.changed,
+            || entry2.accepted() == e2_1 + 1 && entry2.closed() == 3,
+            "entry2 probe 60s later",
+        )
+        .await?;
+
+        rig.cancel.cancel();
+        Ok(())
     }
 }

@@ -13,7 +13,11 @@ use tokio::sync::oneshot;
 use tracing::trace;
 
 use super::{Source, TransportAddrInfo, TransportAddrUsage};
-use crate::{address_lookup::AddressLookupFailed, metrics::SocketMetrics, socket::transports};
+use crate::{
+    address_lookup::AddressLookupFailed,
+    metrics::SocketMetrics,
+    socket::{relay_policy::RelayAllowlist, transports},
+};
 
 /// Maximum number of non-relay paths we keep around per endpoint.
 pub(super) const MAX_NON_RELAY_PATHS: usize = 30;
@@ -34,11 +38,16 @@ pub(super) struct RemotePathState {
     /// These paths might be entirely impossible to use, since they are added by Address Lookup
     /// mechanisms. The are only potentially usable.
     paths: FxHashMap<transports::Addr, PathState>,
+    /// ember: relay addresses known for this remote inside [`Self::allowlist`] that are currently shelved by
+    /// [`Self::disabled_relays`], restored when `set_disabled_relays` allows them again.
+    shelved_relays: FxHashMap<transports::Addr, PathState>,
     /// Pending resolve requests from [`Self::resolve_remote`].
     pending_resolve_requests: VecDeque<oneshot::Sender<Result<(), AddressLookupFailed>>>,
     metrics: Arc<SocketMetrics>,
-    /// ember: relays the remote is not to be reached through (`ConnectOptions::with_disabled_relays`): paths through
-    /// them are never kept, whoever named them (the app, Address Lookup).
+    /// ember: immutable endpoint relay ceiling (`Builder::relay_allowlist`).
+    allowlist: RelayAllowlist,
+    /// ember: relays the remote is not to be reached through (`Endpoint::set_disabled_relays`,
+    /// `ConnectOptions::with_disabled_relays`): shelved out of `paths` while disabled.
     disabled_relays: BTreeSet<RelayUrl>,
 }
 
@@ -59,21 +68,61 @@ pub(super) enum PathStatus {
 }
 
 impl RemotePathState {
-    pub(super) fn new(metrics: Arc<SocketMetrics>) -> Self {
+    pub(super) fn new(metrics: Arc<SocketMetrics>, allowlist: RelayAllowlist) -> Self {
         Self {
             paths: Default::default(),
+            shelved_relays: Default::default(),
             pending_resolve_requests: Default::default(),
             metrics,
+            allowlist,
             disabled_relays: Default::default(),
         }
     }
 
-    /// ember: the relays the remote is not to be reached through from now on (as the last connect said them): the
-    /// paths known through them are let go.
-    pub(super) fn set_disabled_relays(&mut self, relays: BTreeSet<RelayUrl>) {
+    /// ember: updates the relays the remote is not to be reached through, shelving newly disabled relay addresses out
+    /// of `paths` and restoring previously shelved ones that are now allowed (within `allowlist`). Returns the relay
+    /// addresses restored to `paths`.
+    pub(super) fn set_disabled_relays(&mut self, relays: BTreeSet<RelayUrl>) -> Vec<transports::Addr> {
+        let now = Instant::now();
+        let was_empty = self.paths.is_empty();
         self.disabled_relays = relays;
+        let allowlist = &self.allowlist;
         let disabled = &self.disabled_relays;
-        self.paths.retain(|addr, _| !is_disabled(disabled, addr));
+        self.paths.retain(|addr, _| allowlist_allows(allowlist, addr));
+        self.shelved_relays.retain(|addr, _| allowlist_allows(allowlist, addr));
+
+        let to_shelve: Vec<transports::Addr> = self
+            .paths
+            .keys()
+            .filter(|addr| is_disabled(disabled, addr))
+            .cloned()
+            .collect();
+        for addr in to_shelve {
+            if let Some(mut state) = self.paths.remove(&addr) {
+                if matches!(state.status, PathStatus::Open) {
+                    self.metrics.transport_relay_paths_removed.inc();
+                    state.status = PathStatus::Inactive(now);
+                }
+                merge_path_state(&mut self.shelved_relays, addr, state);
+            }
+        }
+
+        let restored: Vec<transports::Addr> = self
+            .shelved_relays
+            .keys()
+            .filter(|addr| !is_disabled(disabled, addr) && allowlist_allows(allowlist, addr))
+            .cloned()
+            .collect();
+        for addr in &restored {
+            if let Some(state) = self.shelved_relays.remove(addr) {
+                merge_path_state(&mut self.paths, addr.clone(), state);
+            }
+        }
+
+        if was_empty && !self.paths.is_empty() {
+            self.emit_pending_resolve_requests(None);
+        }
+        restored
     }
 
     /// ember: whether `addr` is a path through a relay the remote is not to be reached through.
@@ -103,7 +152,14 @@ impl RemotePathState {
     ///
     /// This will emit pending resolve requests and trigger pruning paths.
     pub(super) fn insert_open_path(&mut self, addr: transports::Addr, source: Source) {
+        if !allowlist_allows(&self.allowlist, &addr) {
+            return;
+        }
         if self.is_disabled(&addr) {
+            let now = Instant::now();
+            let state = self.shelved_relays.entry(addr).or_default();
+            state.status = PathStatus::Inactive(now);
+            state.sources.insert(source, now);
             return;
         }
         match addr {
@@ -161,8 +217,17 @@ impl RemotePathState {
         let now = Instant::now();
         let was_empty = self.paths.is_empty();
         for addr in addrs {
+            if !allowlist_allows(&self.allowlist, &addr) {
+                trace!(?addr, "a path through a relay outside endpoint allowlist: ignored");
+                continue;
+            }
             if self.is_disabled(&addr) {
-                trace!(?addr, "a path through a disabled relay: not kept");
+                trace!(?addr, "a path through a disabled relay: shelved");
+                self.shelved_relays
+                    .entry(addr)
+                    .or_default()
+                    .sources
+                    .insert(source.clone(), now);
                 continue;
             }
             self.paths
@@ -250,6 +315,35 @@ impl RemotePathState {
 /// ember: whether `addr` goes through one of `disabled`.
 fn is_disabled(disabled: &BTreeSet<RelayUrl>, addr: &transports::Addr) -> bool {
     matches!(addr, transports::Addr::Relay(url, _) if disabled.contains(url))
+}
+
+/// ember: whether `addr` is allowed by the endpoint's immutable relay allowlist.
+fn allowlist_allows(allowlist: &RelayAllowlist, addr: &transports::Addr) -> bool {
+    match addr {
+        transports::Addr::Relay(url, _) => allowlist.allows(url),
+        _ => true,
+    }
+}
+
+fn merge_path_state(
+    target: &mut FxHashMap<transports::Addr, PathState>,
+    addr: transports::Addr,
+    state: PathState,
+) {
+    match target.get_mut(&addr) {
+        Some(existing) => {
+            for (src, ts) in state.sources {
+                existing
+                    .sources
+                    .entry(src)
+                    .and_modify(|t| *t = (*t).max(ts))
+                    .or_insert(ts);
+            }
+        }
+        None => {
+            target.insert(addr, state);
+        }
+    }
 }
 
 /// The state of a single path to the remote endpoint.
@@ -590,7 +684,7 @@ mod tests {
 
     #[test]
     fn test_insert_open_path() {
-        let mut state = RemotePathState::new(Default::default());
+        let mut state = RemotePathState::new(Default::default(), Default::default());
         let addr = ip_addr(1000);
         let source = Source::Connection;
 
@@ -609,7 +703,7 @@ mod tests {
     #[test]
     fn test_abandoned_path() {
         let metrics = Arc::new(SocketMetrics::default());
-        let mut state = RemotePathState::new(metrics.clone());
+        let mut state = RemotePathState::new(metrics.clone(), Default::default());
 
         // Test: Open goes to Inactive
         let addr_open = ip_addr(1000);
@@ -681,7 +775,7 @@ mod tests {
     #[test]
     fn empty_insert_does_not_drain_pending() {
         let metrics = Arc::new(SocketMetrics::default());
-        let mut state = RemotePathState::new(metrics);
+        let mut state = RemotePathState::new(metrics, Default::default());
 
         let (tx, mut rx) = oneshot::channel();
         state.resolve_remote(tx);
@@ -708,7 +802,7 @@ mod tests {
     #[test]
     fn address_lookup_finished_empty_emits_no_results() {
         let metrics = Arc::new(SocketMetrics::default());
-        let mut state = RemotePathState::new(metrics);
+        let mut state = RemotePathState::new(metrics, Default::default());
 
         let (tx, mut rx) = oneshot::channel();
         state.resolve_remote(tx);
@@ -720,5 +814,42 @@ mod tests {
             resolved,
             Err(AddressLookupFailed::NoResults { .. })
         ));
+    }
+
+    #[test]
+    fn shelved_relays_restore_within_allowlist() {
+        let id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let a: RelayUrl = "https://a.example.invalid".parse().unwrap();
+        let b: RelayUrl = "https://b.example.invalid".parse().unwrap();
+        let c: RelayUrl = "https://c.example.invalid".parse().unwrap();
+        let addr_a = transports::Addr::Relay(a.clone(), id);
+        let addr_b = transports::Addr::Relay(b.clone(), id);
+        let addr_c = transports::Addr::Relay(c.clone(), id);
+
+        let allowlist = RelayAllowlist::new(Some([a.clone(), b.clone()].into()));
+        let mut state = RemotePathState::new(Default::default(), allowlist);
+        state.insert_multiple(
+            [addr_a.clone(), addr_b.clone(), addr_c.clone()].into_iter(),
+            Source::App,
+        );
+        assert!(state.paths.contains_key(&addr_a));
+        assert!(state.paths.contains_key(&addr_b));
+        assert!(!state.paths.contains_key(&addr_c));
+
+        let restored = state.set_disabled_relays([a.clone()].into());
+        assert!(restored.is_empty());
+        assert!(!state.paths.contains_key(&addr_a));
+        assert!(state.shelved_relays.contains_key(&addr_a));
+
+        // Re-offering c while a is disabled never shelves or adds c.
+        state.insert_multiple([addr_a.clone(), addr_c.clone()].into_iter(), Source::Connection);
+        assert!(!state.paths.contains_key(&addr_a));
+        assert!(!state.shelved_relays.contains_key(&addr_c));
+
+        let restored = state.set_disabled_relays(Default::default());
+        assert_eq!(restored, vec![addr_a.clone()]);
+        assert!(state.paths.contains_key(&addr_a));
+        assert!(state.shelved_relays.is_empty());
+        assert!(!state.paths.contains_key(&addr_c));
     }
 }

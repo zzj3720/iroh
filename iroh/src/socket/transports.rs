@@ -737,18 +737,24 @@ impl NetworkChangeSender {
 
     /// ember: a relay removed from the endpoint, from every relay transport (`Builder::home_on_every_relay`: each but
     /// the first has a map of its own, which the endpoint's removal did not reach).
-    pub(crate) fn remove_relay(&self, url: RelayUrl) {
+    pub(crate) async fn remove_relay(&self, url: RelayUrl) {
         for relay in &self.relay {
-            relay.remove_relay(url.clone());
+            relay.remove_relay(url.clone()).await;
         }
     }
 
     /// ember: a relay inserted into the endpoint, told every relay transport (the one bound to be home on it takes it
-    /// again).
-    pub(crate) fn insert_relay(&self, url: RelayUrl, config: Arc<iroh_relay::RelayConfig>) {
+    /// again). Returns `true` if any transport started connecting to `url` as its home relay.
+    pub(crate) async fn insert_relay(
+        &self,
+        url: RelayUrl,
+        config: Arc<iroh_relay::RelayConfig>,
+    ) -> bool {
+        let mut connecting_home = false;
         for relay in &self.relay {
-            relay.insert_relay(url.clone(), config.clone());
+            connecting_home |= relay.insert_relay(url.clone(), config.clone()).await;
         }
+        connecting_home
     }
 
     /// Rebinds underlying connections, if necessary.
@@ -1327,6 +1333,11 @@ impl TransportsSender {
                 if !relay_policies.allowlist.allows(url) || !RelayPolicies::allows_in(&policy, endpoint_id, url) {
                     relay_policies.counted(url, endpoint_id, false);
                     trace!(%network_path, "relay disallowed by endpoint or remote policy: dropped");
+                    return Poll::Ready(Ok(()));
+                }
+                if relay_policies.is_removed(url) {
+                    drop(policy);
+                    trace!(%network_path, "relay removed locally: dropped");
                     return Poll::Ready(Ok(()));
                 }
                 let mut has_valid_sender = false;

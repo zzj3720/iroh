@@ -404,6 +404,11 @@ pub(crate) struct Socket {
     pub(crate) hooks: EndpointHooksList,
     /// Tracing span for this endpoint.
     pub(crate) span: Span,
+    /// ember: test barrier that pauses `ActorMessage::RelayInserted` mid-flight so concurrent `remove_relay` ordering
+    /// can be exercised deterministically without sleeps.
+    #[cfg(test)]
+    pause_next_relay_insert:
+        Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl Socket {
@@ -963,6 +968,10 @@ impl EndpointInner {
         let ipv6_reported = Arc::new(AtomicBool::new(false));
         let relay_udp = Arc::new(AtomicBool::new(relay_udp));
 
+        // ember: the relays each remote is not to be reached through (`Endpoint::set_disabled_relays`) and those locally
+        // removed (`Endpoint::remove_relay`).
+        let relay_policies = relay_policy::RelayPolicies::with_allowlist(relay_allowlist.clone());
+
         let relay_actor_config = RelayActorConfig {
             my_relay: HomeRelayWatch::default(),
             secret_key: secret_key.clone(),
@@ -974,7 +983,8 @@ impl EndpointInner {
             tls_config: tls_config.clone(),
             metrics: metrics.socket.clone(),
             relay_map: relay_map.clone(),
-            relay_allowlist: relay_allowlist.clone(),
+            relay_allowlist,
+            relay_policies: relay_policies.clone(),
             excludes: Default::default(),
             own: None,
             others: Vec::new(),
@@ -990,8 +1000,6 @@ impl EndpointInner {
             shutdown_token.child_token(),
         )
         .map_err(|err| e!(BindError::Sockets, err))?;
-        // ember: the relays each remote is not to be reached through (`Endpoint::set_disabled_relays`).
-        let relay_policies = relay_policy::RelayPolicies::with_allowlist(relay_allowlist);
         transports.set_relay_policies(relay_policies.clone());
 
         if let Some(v4_port) = transports.local_addrs().into_iter().find_map(|t| {
@@ -1061,6 +1069,8 @@ impl EndpointInner {
             relay_udp,
             hooks,
             span: span.clone(),
+            #[cfg(test)]
+            pause_next_relay_insert: Default::default(),
         });
 
         let mut endpoint_config =
@@ -1143,6 +1153,7 @@ impl EndpointInner {
             transports_network_change,
             direct_addr_done_rx,
             call_notify_quic_network_change: None,
+            reopen_on_connect: Default::default(),
         };
         // Initialize addresses
         #[cfg(not(wasm_browser))]
@@ -1292,33 +1303,58 @@ impl EndpointInner {
         relay: RelayUrl,
         endpoint: Arc<RelayConfig>,
     ) -> Option<Arc<RelayConfig>> {
-        if !self.relay_policies.allowlist.allows(&relay) { return None; }
+        if !self.relay_policies.allowlist.allows(&relay) {
+            return None;
+        }
         let endpoint = self.relay_policies.allowlist.config(endpoint);
-        let res = self.relay_map.insert(relay.clone(), endpoint.clone());
-        // ember: told every relay transport (`Builder::home_on_every_relay`).
-        self.actor_sender
-            .send(ActorMessage::RelayInserted(relay, endpoint))
+        // ember: serialized through `Actor` so `relay_map`, `relay_policies.removed`, every relay transport
+        // (`Builder::home_on_every_relay`), and `RemoteMap` apply `insert_relay` and `remove_relay` in one order.
+        let (tx, rx) = oneshot::channel();
+        if self
+            .actor_sender
+            .send(ActorMessage::RelayInserted(relay, endpoint, tx))
             .await
-            .ok();
-        self.actor_sender
-            .send(ActorMessage::RelayMapChange)
-            .await
-            .ok();
-        res
+            .is_ok()
+        {
+            rx.await.ok().flatten()
+        } else {
+            None
+        }
     }
 
     pub(crate) async fn remove_relay(&self, relay: &RelayUrl) -> Option<Arc<RelayConfig>> {
-        let res = self.relay_map.remove(relay);
-        // ember: every relay transport ends its connection to it, and stops being home on it.
-        self.actor_sender
-            .send(ActorMessage::RelayRemoved(relay.clone()))
+        // ember: serialized through `Actor` so an earlier queued `insert_relay` cannot clear `removed` after a later
+        // `remove_relay` deleted `relay` from `relay_map`.
+        let (tx, rx) = oneshot::channel();
+        if self
+            .actor_sender
+            .send(ActorMessage::RelayRemoved(relay.clone(), tx))
             .await
-            .ok();
-        self.actor_sender
-            .send(ActorMessage::RelayMapChange)
-            .await
-            .ok();
-        res
+            .is_ok()
+        {
+            rx.await.ok().flatten()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pause_next_relay_insert(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.sock.pause_next_relay_insert.lock().expect("poisoned") = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_relay_removed(&self, relay: &RelayUrl) -> bool {
+        self.relay_policies.is_removed(relay)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_relay(&self, relay: &RelayUrl) -> bool {
+        self.relay_map.contains(relay)
     }
 
     /// Adds an external address to advertise to peers.
@@ -1371,25 +1407,27 @@ impl EndpointInner {
 
     /// Change the entrances to existing relays, including actors already connected to them.
     pub(crate) async fn set_relay_entries(&self, entries: Vec<(RelayUrl, Vec<RelayUrl>)>) {
-        let entries: Vec<_> = entries.into_iter()
+        let entries: Vec<_> = entries
+            .into_iter()
             .filter(|(url, _)| self.relay_policies.allowlist.allows(url))
-            .map(|(url, list)| (url, list.into_iter().filter(|entry| self.relay_policies.allowlist.allows(entry)).collect::<Vec<_>>()))
+            .map(|(url, list)| {
+                (
+                    url,
+                    list.into_iter()
+                        .filter(|entry| self.relay_policies.allowlist.allows(entry))
+                        .collect::<Vec<_>>(),
+                )
+            })
             .collect();
-        for url in self.relay_map.urls::<Vec<RelayUrl>>() {
-            if let Some(config) = self.relay_map.get(&url) {
-                let routes = entries
-                    .iter()
-                    .find(|(relay, _)| relay == &url)
-                    .map(|(_, urls)| urls.clone())
-                    .unwrap_or_default();
-                self.relay_map
-                    .insert(url, Arc::new(config.as_ref().clone().with_entries(routes)));
-            }
-        }
-        self.actor_sender
-            .send(ActorMessage::RelayEntriesChange(entries))
+        let (tx, rx) = oneshot::channel();
+        if self
+            .actor_sender
+            .send(ActorMessage::RelayEntriesChange(entries, tx))
             .await
-            .ok();
+            .is_ok()
+        {
+            rx.await.ok();
+        }
     }
 
     #[cfg(all(test, with_crypto_provider))]
@@ -1511,7 +1549,6 @@ impl EndpointInner {
 #[allow(clippy::enum_variant_names)]
 enum ActorMessage {
     NetworkChange,
-    RelayMapChange,
     #[debug("ResolveRemote(..)")]
     ResolveRemote(
         EndpointAddr,
@@ -1529,12 +1566,18 @@ enum ActorMessage {
     /// ember: every relay link dialed again (`Endpoint::set_relay_udp`).
     ReconnectRelays,
     /// Forwarding entrances changed, without a change to the relay identities.
-    RelayEntriesChange(Vec<(RelayUrl, Vec<RelayUrl>)>),
-    /// ember: a relay removed from the endpoint, told every relay transport.
-    RelayRemoved(RelayUrl),
-    /// ember: a relay inserted into the endpoint, told every relay transport.
+    #[debug("RelayEntriesChange(..)")]
+    RelayEntriesChange(Vec<(RelayUrl, Vec<RelayUrl>)>, oneshot::Sender<()>),
+    /// ember: a relay removed from the endpoint, told every relay transport and remote actor.
+    #[debug("RelayRemoved({_0})")]
+    RelayRemoved(RelayUrl, oneshot::Sender<Option<Arc<RelayConfig>>>),
+    /// ember: a relay inserted into the endpoint, told every relay transport and remote actor.
     #[debug("RelayInserted({_0})")]
-    RelayInserted(RelayUrl, Arc<RelayConfig>),
+    RelayInserted(
+        RelayUrl,
+        Arc<RelayConfig>,
+        oneshot::Sender<Option<Arc<RelayConfig>>>,
+    ),
     /// ember: a remote's disabled relays changed: its actor goes by them, then the sender is told.
     #[debug("RelayPolicy(..)")]
     RelayPolicy(EndpointId, oneshot::Sender<()>),
@@ -1625,6 +1668,10 @@ struct Actor {
     /// until the gateway appears. Once it does, we notify immediately.
     /// After 5s total we notify anyway even without a gateway.
     call_notify_quic_network_change: Option<PendingNetworkChangeNotify>,
+    /// ember: relays explicitly inserted via [`EndpointInner::insert_relay`] that are still connecting as home relays;
+    /// once `home_relay_watcher` observes them connected, `RemoteMap` is notified once while ordinary home-relay
+    /// reconnects do not trigger path-reopen notifications.
+    reopen_on_connect: BTreeSet<RelayUrl>,
 }
 
 impl Actor {
@@ -1644,6 +1691,8 @@ impl Actor {
 
         let mut receiver_closed = false;
         let mut portmap_watcher_closed = false;
+        let mut home_relay_watcher = self.sock.home_relay_watch.clone();
+        let mut home_relay_watcher_closed = false;
 
         let mut net_report_watcher = self.sock.net_report.watch();
 
@@ -1694,6 +1743,27 @@ impl Actor {
                         }
                         Err(_) => {
                             warn!("local addr watcher stopped");
+                        }
+                    }
+                }
+                statuses = home_relay_watcher.updated(), if !home_relay_watcher_closed => {
+                    match statuses {
+                        Ok(statuses) => {
+                            let ready: Vec<RelayUrl> = statuses
+                                .into_iter()
+                                .filter(|s| s.is_connected())
+                                .map(|s| s.url().clone())
+                                .filter(|url| {
+                                    self.reopen_on_connect.remove(url)
+                                        && !self.sock.relay_policies.is_removed(url)
+                                })
+                                .collect();
+                            for url in ready {
+                                self.remote_map.on_relay_connected(&url).await;
+                            }
+                        }
+                        Err(_) => {
+                            home_relay_watcher_closed = true;
                         }
                     }
                 }
@@ -1924,20 +1994,69 @@ impl Actor {
             ActorMessage::NetworkChange => {
                 self.network_monitor.network_change().await.ok();
             }
-            ActorMessage::RelayMapChange => {
-                self.handle_relay_map_change();
-            }
             ActorMessage::ReconnectRelays => {
                 self.transports_network_change.reconnect_relays();
             }
-            ActorMessage::RelayEntriesChange(entries) => {
+            ActorMessage::RelayEntriesChange(entries, done) => {
+                for url in self.sock.relay_map.urls::<Vec<RelayUrl>>() {
+                    if let Some(config) = self.sock.relay_map.get(&url) {
+                        let routes = entries
+                            .iter()
+                            .find(|(relay, _)| relay == &url)
+                            .map(|(_, urls)| urls.clone())
+                            .unwrap_or_default();
+                        self.sock
+                            .relay_map
+                            .insert(url, Arc::new(config.as_ref().clone().with_entries(routes)));
+                    }
+                }
                 self.transports_network_change.set_relay_entries(entries);
+                done.send(()).ok();
             }
-            ActorMessage::RelayRemoved(url) => {
-                self.transports_network_change.remove_relay(url);
+            ActorMessage::RelayRemoved(url, done) => {
+                let prev = self.sock.relay_map.remove(&url);
+                self.sock.relay_policies.set_removed(&url, true);
+                self.reopen_on_connect.remove(&url);
+                self.transports_network_change.remove_relay(url.clone()).await;
+                self.remote_map.on_relay_removed(&url).await;
+                self.handle_relay_map_change();
+                done.send(prev).ok();
             }
-            ActorMessage::RelayInserted(url, config) => {
-                self.transports_network_change.insert_relay(url, config);
+            ActorMessage::RelayInserted(url, config, done) => {
+                let prev = self.sock.relay_map.insert(url.clone(), config.clone());
+                let connecting_home = self
+                    .transports_network_change
+                    .insert_relay(url.clone(), config)
+                    .await;
+                #[cfg(test)]
+                {
+                    let pause = self
+                        .sock
+                        .pause_next_relay_insert
+                        .lock()
+                        .expect("poisoned")
+                        .take();
+                    if let Some((entered, release)) = pause {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                }
+                self.sock.relay_policies.set_removed(&url, false);
+                let already_connected = self
+                    .sock
+                    .home_relay_watch
+                    .clone()
+                    .get()
+                    .iter()
+                    .any(|s| s.url() == &url && s.is_connected());
+                if !connecting_home || already_connected {
+                    self.reopen_on_connect.remove(&url);
+                    self.remote_map.on_relay_connected(&url).await;
+                } else {
+                    self.reopen_on_connect.insert(url.clone());
+                }
+                self.handle_relay_map_change();
+                done.send(prev).ok();
             }
             ActorMessage::ResolveRemote(addr, disabled, tx) => {
                 self.remote_map

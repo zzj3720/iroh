@@ -262,13 +262,35 @@ impl RelayNetworkChangeSender {
     }
 
     /// ember: the relay removed from the endpoint (`RelayActor::remove_relay`).
-    pub(super) fn remove_relay(&self, url: RelayUrl) {
-        self.send_relay_actor(RelayActorMessage::RemoveRelay(url));
+    pub(super) async fn remove_relay(&self, url: RelayUrl) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .sender
+            .send(RelayActorMessage::RemoveRelay(url, tx))
+            .await
+            .is_ok()
+        {
+            rx.await.ok();
+        }
     }
 
     /// ember: a relay inserted into the endpoint (`RelayActor::insert_relay`).
-    pub(super) fn insert_relay(&self, url: RelayUrl, config: std::sync::Arc<iroh_relay::RelayConfig>) {
-        self.send_relay_actor(RelayActorMessage::InsertRelay(url, config));
+    pub(super) async fn insert_relay(
+        &self,
+        url: RelayUrl,
+        config: std::sync::Arc<iroh_relay::RelayConfig>,
+    ) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .sender
+            .send(RelayActorMessage::InsertRelay(url, config, tx))
+            .await
+            .is_ok()
+        {
+            rx.await.unwrap_or(false)
+        } else {
+            false
+        }
     }
 
     pub(super) fn rebind(&self) -> io::Result<()> {

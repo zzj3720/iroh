@@ -59,6 +59,9 @@ type Disabled = HashMap<EndpointId, BTreeSet<RelayUrl>>;
 pub(crate) struct RelayPolicies {
     pub(crate) allowlist: RelayAllowlist,
     inner: Arc<RwLock<Disabled>>,
+    /// ember: relays removed locally via [`crate::Endpoint::remove_relay`] until re-inserted via
+    /// [`crate::Endpoint::insert_relay`].
+    removed: Arc<RwLock<BTreeSet<RelayUrl>>>,
     #[cfg(any(test, feature = "test-utils"))]
     counts: Arc<std::sync::Mutex<HashMap<(RelayUrl, EndpointId), RelayDatagrams>>>,
 }
@@ -98,6 +101,26 @@ impl RelayPolicies {
     /// Whether `remote` may be reached through `relay`.
     pub(crate) fn allows(&self, remote: &EndpointId, relay: &RelayUrl) -> bool {
         self.allowlist.allows(relay) && Self::allows_in(&self.read(), remote, relay)
+    }
+
+    /// Marks `relay` as locally removed (`Endpoint::remove_relay`) or present again (`Endpoint::insert_relay`).
+    pub(crate) fn set_removed(&self, relay: &RelayUrl, is_removed: bool) {
+        let mut removed = self.removed.write().expect("poisoned");
+        if is_removed {
+            removed.insert(relay.clone());
+        } else {
+            removed.remove(relay);
+        }
+    }
+
+    /// Whether `relay` has been locally removed from this endpoint.
+    pub(crate) fn is_removed(&self, relay: &RelayUrl) -> bool {
+        self.removed.read().expect("poisoned").contains(relay)
+    }
+
+    /// Whether `relay` is both allowed by policy for `remote` and not locally removed.
+    pub(crate) fn usable(&self, remote: &EndpointId, relay: &RelayUrl) -> bool {
+        self.allows(remote, relay) && !self.is_removed(relay)
     }
 
     /// The sets, read: [`Self::set`] waits until this is let go. Held only across what does not wait (a sender's

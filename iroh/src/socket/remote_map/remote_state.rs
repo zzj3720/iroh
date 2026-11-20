@@ -262,7 +262,7 @@ impl RemoteStateActor {
                 connections_close: Default::default(),
                 path_events: Default::default(),
                 addr_events: Default::default(),
-                paths: RemotePathState::new(metrics),
+                paths: RemotePathState::new(metrics, relay_policies.allowlist.clone()),
                 last_holepunch: None,
                 selected_path: Default::default(),
                 scheduled_holepunch: None,
@@ -280,7 +280,7 @@ impl RemoteStateActor {
         };
         // ember: an actor started anew goes by the remote's disabled relays as they are.
         let disabled = actor.state.relay_policies.disabled(&endpoint_id);
-        actor.state.paths.set_disabled_relays(disabled);
+        let _ = actor.state.paths.set_disabled_relays(disabled);
         actor
     }
 
@@ -486,48 +486,127 @@ impl RemoteStateActor {
                 self.apply_relay_policy();
                 done.send(()).ok();
             }
+            RemoteStateMessage::RelayRemoved(url, done) => {
+                self.handle_relay_removed(url);
+                done.send(()).ok();
+            }
+            RemoteStateMessage::RelayConnected(url) => {
+                self.handle_relay_connected(url);
+            }
         }
     }
 
     /// ember: goes by the remote's disabled relays as they are now (`Endpoint::set_disabled_relays`, `ConnectOptions::with_disabled_relays`): every address of it
-    /// through a disabled relay forgotten, with the paths waiting to be opened to one, and on every
-    /// connection the paths through one, and those being opened, closed and taken out of the connection's state at
-    /// once (so no selection takes one before its abandon is polled). A selected path through one is selected no more,
-    /// and another is selected among those left: an IP path stays as it is. Where such a path is a connection's last,
-    /// QUIC cannot close it: a path through each relay allowed is opened first, and it is closed as soon as another is
-    /// established (`close_forbidden_paths`); what is sent on it meanwhile the sender drops.
+    /// through a disabled relay is shelved out of `paths` (and restored when allowed again), with the paths waiting to
+    /// be opened to one dropped, and on every connection the paths through one, and those being opened, closed and
+    /// taken out of the connection's state at once (so no selection takes one before its abandon is polled). When
+    /// shelved relays become allowed again, their `relay_lost` counters are cleared and client connections reopen paths
+    /// through them immediately.
     fn apply_relay_policy(&mut self) {
         let endpoint_id = self.state.endpoint_id;
         let policies = self.state.relay_policies.clone();
-        self.state.paths.set_disabled_relays(policies.disabled(&endpoint_id));
-        let allowed = |addr: &transports::Addr| relay_allowed(&policies, &endpoint_id, addr);
-        self.state.paths.retain(|addr| allowed(addr));
-        self.state.pending_open_paths.retain(|tuple| allowed(&tuple.remote()));
-        if self.state.selected_path.as_ref().is_some_and(|tuple| !allowed(&tuple.remote())) {
+        let restored = self.state.paths.set_disabled_relays(policies.disabled(&endpoint_id));
+        self.state.paths.retain(|addr| relay_allowed(&policies, &endpoint_id, addr));
+        self.state
+            .pending_open_paths
+            .retain(|tuple| relay_usable(&policies, &endpoint_id, &tuple.remote()));
+        if self
+            .state
+            .selected_path
+            .as_ref()
+            .is_some_and(|tuple| !relay_usable(&policies, &endpoint_id, &tuple.remote()))
+        {
             self.state.selected_path = None;
         }
         let relays: Vec<_> = self
             .state
             .paths
             .addrs()
-            .filter(|addr| addr.is_relay())
+            .filter(|addr| addr.is_relay() && relay_usable(&policies, &endpoint_id, addr))
             .map(|addr| transports::FourTuple::from_remote(addr.clone()))
             .collect();
         for (conn_id, conn_state) in self.connections.iter_mut() {
+            if conn_state.relay_lost_total < RELAY_CONN_LOST_MAX {
+                for addr in &restored {
+                    conn_state.relay_lost.remove(addr);
+                }
+            }
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
-            let forbidden = conn_state.paths.values().any(|tuple| !allowed(&tuple.remote()));
+            let forbidden = conn_state
+                .paths
+                .values()
+                .any(|tuple| !relay_usable(&policies, &endpoint_id, &tuple.remote()));
             if forbidden && conn.side().is_client() {
                 // (a way left before one is given up: QUIC keeps a connection's last path)
                 for open_addr in &relays {
                     self.state.open_path_on_conn(*conn_id, conn_state, &conn, open_addr);
                 }
             }
-            close_forbidden_paths(&policies, &endpoint_id, *conn_id, conn_state, &conn);
+            self.state.close_forbidden_paths(*conn_id, conn_state, &conn);
+        }
+        if !restored.is_empty() {
+            self.reopen_relay_paths();
         }
         self.select_path();
         self.trigger_holepunching();
+    }
+
+    /// ember: `url` was locally removed (`Endpoint::remove_relay`): keep `url` in `State::paths` as a known remote
+    /// address for when `url` is inserted again, but immediately close paths through `url` on active connections so
+    /// they neither wait out idle timeout nor exhaust `relay_lost`.
+    fn handle_relay_removed(&mut self, url: RelayUrl) {
+        let endpoint_id = self.state.endpoint_id;
+        let policies = self.state.relay_policies.clone();
+        self.state
+            .pending_open_paths
+            .retain(|tuple| relay_usable(&policies, &endpoint_id, &tuple.remote()));
+        if self
+            .state
+            .selected_path
+            .as_ref()
+            .is_some_and(|tuple| !relay_usable(&policies, &endpoint_id, &tuple.remote()))
+        {
+            self.state.selected_path = None;
+        }
+        let relays: Vec<_> = self
+            .state
+            .paths
+            .addrs()
+            .filter(|addr| addr.is_relay() && relay_usable(&policies, &endpoint_id, addr))
+            .map(|addr| transports::FourTuple::from_remote(addr.clone()))
+            .collect();
+        let target = transports::Addr::Relay(url, endpoint_id);
+        for (conn_id, conn_state) in self.connections.iter_mut() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            let has_removed = conn_state.paths.values().any(|tuple| tuple.remote() == target);
+            if has_removed && conn.side().is_client() {
+                for open_addr in &relays {
+                    self.state.open_path_on_conn(*conn_id, conn_state, &conn, open_addr);
+                }
+            }
+            self.state.close_forbidden_paths(*conn_id, conn_state, &conn);
+        }
+        self.select_path();
+        self.trigger_holepunching();
+    }
+
+    /// ember: local relay `url` is connected and usable again (e.g. after `Endpoint::insert_relay` reconnects): clear
+    /// per-relay `relay_lost` for `url` and reopen missing client paths through it.
+    fn handle_relay_connected(&mut self, url: RelayUrl) {
+        let addr = transports::Addr::Relay(url, self.state.endpoint_id);
+        if !self.state.relay_usable(&addr) || !self.state.paths.addrs().any(|a| a == &addr) {
+            return;
+        }
+        for conn_state in self.connections.values_mut() {
+            if conn_state.relay_lost_total < RELAY_CONN_LOST_MAX {
+                conn_state.relay_lost.remove(&addr);
+            }
+        }
+        self.reopen_relay_paths();
     }
 
     /// Handles [`RemoteStateMessage::AddConnection`].
@@ -594,7 +673,7 @@ impl RemoteStateActor {
                     .state
                     .paths
                     .addrs()
-                    .filter(|addr| addr.is_relay())
+                    .filter(|addr| addr.is_relay() && self.state.relay_usable(addr))
                     .map(|addr| transports::FourTuple::from_remote(addr.clone()))
                     .collect::<Vec<_>>();
                 for open_addr in relays {
@@ -868,10 +947,10 @@ impl RemoteStateActor {
                 // ember: a path through a relay disabled for the remote (one the remote opened, or
                 // one that was being opened as the policy changed): closed, never taken.
                 if let Some(tuple) = self.state.transport_tuple_for_path(&path)
-                    && !self.state.relay_allowed(&tuple.remote())
+                    && !self.state.relay_usable(&tuple.remote())
                 {
                     conn_state.relay_opening.remove(&path_id);
-                    debug!(%conn_id, %path_id, "closing a path established through a relay disabled for the remote");
+                    debug!(%conn_id, %path_id, "closing a path established through a disabled or removed relay");
                     if !close_policy_path(&path) {
                         // (the connection's only path: taken, and closed once another opens)
                         self.state.register_and_configure_path(conn_id, conn_state, &path);
@@ -887,7 +966,7 @@ impl RemoteStateActor {
                 conn_state.path_state.record_custom_opening(conn_state.custom_opening.len());
                 conn_state.relay_opening.remove(&path_id);
                 // ember: a path through a relay left out that could not be closed while it was the last one, closed now.
-                close_forbidden_paths(&self.state.relay_policies, &self.state.endpoint_id, conn_id, conn_state, &conn);
+                self.state.close_forbidden_paths(conn_id, conn_state, &conn);
                 if let Some(ref open) = opened {
                     if matches!(open.remote(), transports::Addr::Custom(_)) {
                         conn_state.custom_not_before = None;
@@ -958,7 +1037,10 @@ impl RemoteStateActor {
                 // If the remote closed our selected path, select a new one.
                 self.select_path();
                 // ember: a relay's path, tried again a moment later (`reopen_relay_paths`).
-                if network_path.is_relay() && self.state.several_relays {
+                if network_path.is_relay()
+                    && self.state.several_relays
+                    && self.state.relay_usable(&network_path.remote())
+                {
                     self.state.relay_reopen_at = Some(Instant::now() + RELAY_REOPEN);
                 }
                 // ember: a custom path that worked and was given up is opened again at once (`open_custom_paths`). One
@@ -1002,7 +1084,7 @@ impl RemoteStateActor {
         // ember: never a path through a relay disabled for the remote (one closed, its abandon not
         // polled yet).
         let selected_addr = selection.selected().cloned()
-            .filter(|addr| self.state.relay_allowed(&addr.remote()));
+            .filter(|addr| self.state.relay_usable(&addr.remote()));
 
         if let Some(addr) = selected_addr
             && self.state.selected_path.as_ref() != Some(&addr)
@@ -1168,7 +1250,7 @@ impl RemoteStateActor {
             .state
             .paths
             .addrs()
-            .filter(|addr| addr.is_relay() && self.state.relay_allowed(addr))
+            .filter(|addr| addr.is_relay() && self.state.relay_usable(addr))
             .map(|addr| transports::FourTuple::from_remote(addr.clone()))
             .collect();
         let mut missing = false;
@@ -1254,9 +1336,9 @@ impl RemoteStateActor {
 }
 
 impl State {
-    /// ember: whether `addr` may be used for this remote (its disabled relays, `Endpoint::set_disabled_relays`).
-    fn relay_allowed(&self, addr: &transports::Addr) -> bool {
-        relay_allowed(&self.relay_policies, &self.endpoint_id, addr)
+    /// ember: whether `addr` is usable right now (allowed by endpoint allowlist & remote disabled set, and not locally removed).
+    fn relay_usable(&self, addr: &transports::Addr) -> bool {
+        relay_usable(&self.relay_policies, &self.endpoint_id, addr)
     }
 
     /// Handles [`RemoteStateMessage::SendDatagram`].
@@ -1310,9 +1392,9 @@ impl State {
                     .any(|a| a.addr == *sockaddr)
             {
                 trace!(%sockaddr, "not sending datagram to our own address");
-            } else if !self.relay_allowed(addr) {
-                // ember: not through a relay disabled for the remote (the sender drops it anyway).
-                trace!(?addr, "not sending datagram through a relay not allowed");
+            } else if !self.relay_usable(addr) {
+                // ember: not through a relay disabled for the remote or locally removed (the sender drops it anyway).
+                trace!(?addr, "not sending datagram through a relay not usable");
 
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
             // know that it is the correct one.
@@ -1333,8 +1415,8 @@ impl State {
         addrs: BTreeSet<TransportAddr>,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
     ) {
-        // ember: none through a relay disabled for the remote.
-        let addrs: Vec<_> = to_transports_addr(self.endpoint_id, addrs).filter(|a| self.relay_allowed(a)).collect();
+        // ember: `insert_multiple` ignores relays outside `allowlist` and shelves relays disabled for the remote.
+        let addrs: Vec<_> = to_transports_addr(self.endpoint_id, addrs).collect();
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         self.paths.resolve_remote(tx);
         // Start Address Lookup if we have no selected path.
@@ -1394,10 +1476,9 @@ impl State {
                     let source = Source::AddressLookup {
                         name: item.provenance().to_string(),
                     };
-                    // ember: none through a relay disabled for the remote.
+                    // ember: `insert_multiple` ignores relays outside `allowlist` and shelves relays disabled for the remote.
                     let addrs: Vec<_> =
                         to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs)
-                            .filter(|a| self.relay_allowed(a))
                             .collect();
                     let known: BTreeSet<transports::Addr> = self.paths.addrs().cloned().collect();
                     self.paths.insert_multiple(addrs.iter().cloned(), source);
@@ -1559,12 +1640,11 @@ impl State {
         if conn_state.paths.values().any(|a| a == open_addr) {
             return None;
         }
-        // ember: never through a relay disabled for the remote.
-        if !self.relay_allowed(&open_addr.remote()) {
+        // ember: never through a relay disabled for the remote or locally removed.
+        if !self.relay_usable(&open_addr.remote()) {
             return None;
         }
         if open_addr.is_relay()
-            && self.several_relays
             && (conn_state
                 .relay_lost
                 .get(&open_addr.remote())
@@ -1648,16 +1728,81 @@ impl State {
             .map(|d| d.addr)
             .collect()
     }
+
+    /// ember: every path of a connection through a relay disabled for the remote or locally removed, and every one
+    /// being opened through one, closed and taken out of the connection's state at once (its `Abandoned` event finds it
+    /// gone). One that cannot be closed yet (the connection's last) is kept, to be closed once another is established.
+    fn close_forbidden_paths(
+        &mut self,
+        conn_id: ConnId,
+        conn_state: &mut ConnectionState,
+        conn: &noq::Connection,
+    ) {
+        let opening: Vec<PathId> = conn_state
+            .relay_opening
+            .iter()
+            .filter(|(_, addr)| !relay_usable(&self.relay_policies, &self.endpoint_id, addr))
+            .map(|(id, _)| *id)
+            .collect();
+        for path_id in opening {
+            // ember: an unestablished path closed before `Established` permanently consumes its QUIC `PathId` when the
+            // peer never saw it (`noq-proto` replenishes `MAX_PATHS` only on `PATH_ABANDON` of a path the peer has), so
+            // canceling it here settles one unit of `relay_lost` and `relay_lost_total` (`Abandoned` later sees `None`).
+            let closed = match conn.path(path_id) {
+                Some(path) => close_policy_path(&path),
+                None => true,
+            };
+            if closed && let Some(relay_addr) = conn_state.relay_opening.remove(&path_id) {
+                *conn_state.relay_lost.entry(relay_addr).or_default() += 1;
+                conn_state.relay_lost_total += 1;
+            }
+        }
+        let open: Vec<PathId> = conn_state
+            .paths
+            .iter()
+            .filter(|(_, tuple)| {
+                !relay_usable(&self.relay_policies, &self.endpoint_id, &tuple.remote())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for path_id in open {
+            let Some(path) = conn.path(path_id) else {
+                if let Some(removed) = conn_state.remove_path(&path_id, conn)
+                    && !conn_state
+                        .paths
+                        .values()
+                        .any(|tuple| tuple.remote() == removed.remote())
+                {
+                    self.paths.abandoned_path(&removed.remote());
+                }
+                continue;
+            };
+            debug!(%conn_id, %path_id, "closing a path through a disabled or removed relay");
+            if close_policy_path(&path)
+                && let Some(removed) = conn_state.remove_path(&path_id, conn)
+                && !conn_state
+                    .paths
+                    .values()
+                    .any(|tuple| tuple.remote() == removed.remote())
+            {
+                self.paths.abandoned_path(&removed.remote());
+            }
+        }
+    }
 }
 
-/// Updates QNT's candidate addresses to be the current set of direct addresses.
-///
-/// `direct_addrs` must be a set of addresses extracted from the endpoint's current
-/// [`DirectAddr`]s.
-/// ember: whether `addr` of `remote` may be used: an address through a relay disabled for the remote may not.
+/// ember: whether `addr` of `remote` is allowed by policy (allowlist and per-remote disabled set).
 fn relay_allowed(policies: &RelayPolicies, remote: &EndpointId, addr: &transports::Addr) -> bool {
     match addr {
         transports::Addr::Relay(url, _) => policies.allows(remote, url),
+        _ => true,
+    }
+}
+
+/// ember: whether `addr` of `remote` is both allowed by policy and not locally removed.
+fn relay_usable(policies: &RelayPolicies, remote: &EndpointId, addr: &transports::Addr) -> bool {
+    match addr {
+        transports::Addr::Relay(url, _) => policies.usable(remote, url),
         _ => true,
     }
 }
@@ -1675,36 +1820,6 @@ fn close_policy_path(path: &noq::Path) -> bool {
             false
         }
         Err(noq_proto::ClosePathError::ClosedPath) | Ok(()) => true,
-    }
-}
-
-/// ember: every path of a connection through a relay disabled for the remote, and every one being opened
-/// through one, closed and taken out of the connection's state at once (its `Abandoned` event finds it gone). One that
-/// cannot be closed yet (the connection's last) is kept, to be closed once another is established.
-fn close_forbidden_paths(
-    policies: &RelayPolicies,
-    remote: &EndpointId,
-    conn_id: ConnId,
-    conn_state: &mut ConnectionState,
-    conn: &noq::Connection,
-) {
-    let opening: Vec<PathId> = conn_state.relay_opening.iter().filter(|(_, addr)| !relay_allowed(policies, remote, addr)).map(|(id, _)| *id).collect();
-    for path_id in opening {
-        conn_state.relay_opening.remove(&path_id);
-        if let Some(path) = conn.path(path_id) {
-            close_policy_path(&path);
-        }
-    }
-    let open: Vec<PathId> = conn_state.paths.iter().filter(|(_, tuple)| !relay_allowed(policies, remote, &tuple.remote())).map(|(id, _)| *id).collect();
-    for path_id in open {
-        let Some(path) = conn.path(path_id) else {
-            conn_state.remove_path(&path_id, conn);
-            continue;
-        };
-        debug!(%conn_id, %path_id, "closing a path through a relay disabled for the remote");
-        if close_policy_path(&path) {
-            conn_state.remove_path(&path_id, conn);
-        }
     }
 }
 
@@ -1934,6 +2049,12 @@ pub(crate) enum RemoteStateMessage {
     /// ember: the remote's disabled relays changed (`Endpoint::set_disabled_relays`): gone by, then told.
     #[debug("ApplyRelayPolicy(..)")]
     ApplyRelayPolicy(oneshot::Sender<()>),
+    /// ember: a relay was locally removed (`Endpoint::remove_relay`): close active paths through it, then acknowledge.
+    #[debug("RelayRemoved({_0})")]
+    RelayRemoved(RelayUrl, oneshot::Sender<()>),
+    /// ember: an inserted local relay connected (`Endpoint::insert_relay`): reopen missing paths.
+    #[debug("RelayConnected({_0})")]
+    RelayConnected(RelayUrl),
 }
 
 /// Information about a holepunch attempt.

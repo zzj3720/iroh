@@ -45,6 +45,17 @@ Alternate relay-entrance probes (`ActiveRelayActor::start_entry_probes`) back of
 candidate, switching entrances, updating `entries`, reconnecting after a failure, or receiving a major network-change
 connection check (`ActiveRelayMessage::CheckConnection`) resets the interval to 30 s; connection failures and major
 network changes also wake an immediate probe round. Probes keep ephemeral identities, require an alternate entrance to
-beat the current one by both 20% and at least 10 ms (`ENTRY_MIN_GAIN`) across the two-round handover hysteresis so
-loopback or scheduling jitter cannot reset backoff or churn sockets, and stay within the configured `[url, ...entries]`
-ceiling.
+be strictly more than 20% faster and at least 10 ms faster (`ENTRY_MIN_GAIN`) — switching immediately on the first
+comparison after startup or `update_entries` and requiring two consecutive rounds thereafter — so loopback or scheduling
+jitter cannot reset backoff or churn sockets, and stay within the configured `[url, ...entries]` ceiling.
+
+Per-remote disabled relay addresses (`Endpoint::set_disabled_relays`, `ConnectOptions::with_disabled_relays`) are
+shelved inside `RemotePathState` instead of erased: while disabled, no further datagrams are handed to relay transports
+and active or opening paths through disabled relays are closed; when `set_disabled_relays` allows a shelved relay again,
+its address returns to `paths`, its per-relay `relay_lost` counter is cleared (within `RELAY_CONN_LOST_MAX`), and
+existing client connections immediately reopen paths through it without redialing or address lookup. Likewise,
+`Endpoint::remove_relay` and `Endpoint::insert_relay` serialize map, tombstone, transport, and remote-actor updates
+through the socket actor: `remove_relay` closes established paths at once without falling back to another transport,
+canceling unestablished opening paths accounts toward `RELAY_CONN_LOST_MAX`, and `insert_relay` reopens client paths
+once that inserted relay connects while leaving ordinary home-relay reconnects unchanged. `Builder::relay_allowlist`
+remains an immutable ceiling, and per-remote `disabled_relays` continues to override `insert_relay`.

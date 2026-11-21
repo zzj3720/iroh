@@ -68,3 +68,7 @@ shortcut. Non-home `ActiveRelayActor`s extend their 60 s `RELAY_INACTIVE_CLEANUP
 datagrams are actually queued and honor that idle deadline across both pending handshakes and reconnect backoffs, so an
 unreachable or idle extra relay is reclaimed instead of retrying until endpoint shutdown.
 
+Selectors may also call `PathSelection::ping` to request one single-path QUIC `PING` (`noq::Path::ping`) on a
+specific open path incarnation after `select_path` applies the selection. `iroh` forwards each distinct request
+at most once per pass without adding probe timers, budgets, or transport restrictions of its own, and ignores
+closed connections, closed paths, generation mismatches, and disabled relays without error.

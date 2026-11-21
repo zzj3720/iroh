@@ -1123,6 +1123,70 @@ impl RemoteStateActor {
 
         self.apply_selected_path();
         self.close_withdrawn_paths(&selection);
+        self.ping_paths(&selection);
+    }
+
+    /// ember: sends one single-path QUIC `PING` for each open path that [`PathSelection::ping`]
+    /// named in this selection pass, carrying no policy here. Closed connections, closed paths,
+    /// generation mismatches, and disabled relays are ignored without error.
+    fn ping_paths(&self, selection: &PathSelection) {
+        for target in &selection.ping {
+            match target {
+                PingTarget::Live {
+                    conn: target_conn,
+                    path_id,
+                    generation,
+                    network_path,
+                } => {
+                    if !self.state.relay_usable(&network_path.remote()) {
+                        continue;
+                    }
+                    for state in self.connections.values() {
+                        let Some(conn) = state.handle.upgrade() else {
+                            continue;
+                        };
+                        if !conn.weak_handle().is_same_connection(target_conn) {
+                            continue;
+                        }
+                        if state.paths.get(path_id) != Some(network_path) {
+                            break;
+                        }
+                        if let Some(expected_gen) = generation
+                            && conn
+                                .path_stats(*path_id)
+                                .is_none_or(|stats| stats.path_generation != *expected_gen)
+                        {
+                            break;
+                        }
+                        if let Some(path) = conn.path(*path_id)
+                            && let Err(error) = path.ping()
+                        {
+                            trace!(?error, ?network_path, %path_id, "could not ping path");
+                        }
+                        break;
+                    }
+                }
+                #[cfg(test)]
+                PingTarget::Test(network_path) => {
+                    if !self.state.relay_usable(&network_path.remote()) {
+                        continue;
+                    }
+                    for state in self.connections.values() {
+                        let Some(conn) = state.handle.upgrade() else {
+                            continue;
+                        };
+                        for (path_id, addr) in &state.paths {
+                            if addr == network_path
+                                && let Some(path) = conn.path(*path_id)
+                                && let Err(error) = path.ping()
+                            {
+                                trace!(?error, ?network_path, %path_id, "could not ping path");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Retire withdrawn custom paths only after this connection has a validated replacement.
@@ -2368,15 +2432,58 @@ pub trait PathSelector: Send + Sync + std::fmt::Debug + 'static {
     fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection;
 }
 
+/// ember: one single-path `PING` request recorded on [`PathSelection`].
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "unstable-custom-transports"), allow(dead_code))]
+enum PingTarget {
+    Live {
+        conn: noq::WeakConnectionHandle,
+        path_id: PathId,
+        generation: Option<u64>,
+        network_path: transports::FourTuple,
+    },
+    #[cfg(test)]
+    Test(transports::FourTuple),
+}
+
+#[cfg_attr(not(feature = "unstable-custom-transports"), allow(dead_code))]
+impl PingTarget {
+    fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Live {
+                    conn: a_conn,
+                    path_id: a_id,
+                    generation: a_gen,
+                    ..
+                },
+                Self::Live {
+                    conn: b_conn,
+                    path_id: b_id,
+                    generation: b_gen,
+                    ..
+                },
+            ) => a_conn.is_same_connection(b_conn) && a_id == b_id && a_gen == b_gen,
+            #[cfg(test)]
+            (Self::Test(a), Self::Test(b)) => a == b,
+            #[cfg(test)]
+            _ => false,
+        }
+    }
+}
+
 /// The set of paths a [`PathSelector`] has chosen.
 ///
-/// Holds at most one selected path and optional custom-path retirement requests.
-/// Build via [`PathSelection::none`], [`PathSelection::set`] and [`PathSelection::close`].
+/// Holds at most one selected path, optional custom-path retirement requests, and optional
+/// single-path ping requests.
+/// Build via [`PathSelection::none`], [`PathSelection::set`], [`PathSelection::close`], and
+/// [`PathSelection::ping`].
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
 pub struct PathSelection {
     selection: Option<transports::FourTuple>,
     close: Vec<transports::FourTuple>,
+    ping: Vec<PingTarget>,
 }
 
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
@@ -2386,6 +2493,7 @@ impl PathSelection {
         Self {
             selection: None,
             close: Vec::new(),
+            ping: Vec::new(),
         }
     }
 
@@ -2418,6 +2526,28 @@ impl PathSelection {
             && !self.close.contains(path.network_path())
         {
             self.close.push(path.network_path().clone());
+        }
+    }
+
+    /// ember: requests one single-path QUIC `PING` on `path` after this selection pass.
+    ///
+    /// Carries no cadence or budget policy. Callers govern when to probe. Duplicate
+    /// requests for the same path incarnation within one selection pass send a single ping,
+    /// and closed paths are ignored without error.
+    #[cfg_attr(not(feature = "unstable-custom-transports"), allow(dead_code))]
+    pub fn ping(&mut self, path: &PathSelectionData<'_>) {
+        let target = match &path.source {
+            StatsSource::Live { path_id, conn } => PingTarget::Live {
+                conn: conn.weak_handle(),
+                path_id: *path_id,
+                generation: conn.path_stats(*path_id).map(|s| s.path_generation),
+                network_path: path.network_path.clone(),
+            },
+            #[cfg(test)]
+            StatsSource::Test(_) => PingTarget::Test(path.network_path.clone()),
+        };
+        if !self.ping.iter().any(|existing| existing.same_target(&target)) {
+            self.ping.push(target);
         }
     }
 
@@ -2642,6 +2772,304 @@ mod selector_close_tests {
             selection.close(&PathSelectionData::for_test(addr, None));
         }
         assert_eq!(selection.close, vec![custom]);
+        assert!(selection.selected().is_none());
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedPingSelector {
+        paths: std::sync::Mutex<Vec<(noq::Connection, PathId, transports::FourTuple)>>,
+        target_conn_stable_id: std::sync::Mutex<Option<usize>>,
+        ping_custom_once: std::sync::atomic::AtomicBool,
+        ping_all_once: std::sync::atomic::AtomicBool,
+        selected: tokio::sync::Notify,
+    }
+
+    impl PathSelector for ScriptedPingSelector {
+        fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection {
+            let mut captured = self.paths.lock().unwrap();
+            captured.clear();
+            let mut selection = PathSelection::none();
+            let target_conn = *self.target_conn_stable_id.lock().unwrap();
+            let ping_custom = self
+                .ping_custom_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let ping_all = self
+                .ping_all_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            for path in ctx.paths() {
+                if path.stats().is_some_and(|stats| stats.same_path_rtt.is_some()) {
+                    if path.network_path().is_relay() && selection.selected().is_none() {
+                        selection.set(&path);
+                    }
+                    if let StatsSource::Live { conn, path_id } = &path.source {
+                        captured.push((conn.clone(), *path_id, path.network_path().clone()));
+                        if ping_custom
+                            && matches!(path.network_path(), transports::FourTuple::Custom { .. })
+                            && Some(conn.stable_id()) == target_conn
+                        {
+                            selection.ping(&path);
+                            selection.ping(&path);
+                        }
+                        if ping_all {
+                            selection.ping(&path);
+                        }
+                    }
+                }
+            }
+            self.selected.notify_waiters();
+            selection
+        }
+    }
+
+    #[tokio::test]
+    async fn selector_ping_sends_only_when_requested_and_once_per_request_and_ignores_closed_paths() {
+        use crate::{
+            Endpoint, RelayMap, RelayMode,
+            endpoint::{QuicTransportConfig, presets},
+            test_utils::{
+                run_relay_server_with,
+                test_transport::{TestNetwork, to_custom_addr},
+            },
+            tls::CaTlsConfig,
+        };
+        let (_, relay_url, _relay_guard) = run_relay_server_with(false).await.unwrap();
+        let relay_map = RelayMap::from(relay_url.clone());
+        let network = TestNetwork::new();
+        let scripted = Arc::new(ScriptedPingSelector::default());
+        // Suppress automatic connection/path keepalives, DPLPMTUD MTU probes, and IP QNT
+        // holepunching, and keep initial RTT high so short CPU stalls cannot fire a PTO PING.
+        let transport = QuicTransportConfig::builder()
+            .keep_alive_interval(Duration::from_secs(60))
+            .default_path_keep_alive_interval(Duration::from_secs(60))
+            .default_path_max_idle_timeout(Duration::from_secs(60))
+            .mtu_discovery_config(None)
+            .initial_rtt(Duration::from_millis(500))
+            .build();
+        let a_key = iroh_base::SecretKey::from_bytes(&[31; 32]);
+        let b_key = iroh_base::SecretKey::from_bytes(&[32; 32]);
+        let a = Endpoint::builder(presets::Minimal)
+            .secret_key(a_key.clone())
+            .alpns(vec![b"ping".to_vec()])
+            .clear_ip_transports()
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(transport.clone())
+            .add_custom_transport(network.create_transport(a_key.public()).unwrap())
+            .path_selector(scripted.clone())
+            .bind()
+            .await
+            .unwrap();
+        let b = Endpoint::builder(presets::Minimal)
+            .secret_key(b_key.clone())
+            .alpns(vec![b"ping".to_vec()])
+            .clear_ip_transports()
+            .relay_mode(RelayMode::Custom(relay_map))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(transport)
+            .add_custom_transport(network.create_transport(b_key.public()).unwrap())
+            .path_selector(Arc::new(CapturePaths::default()))
+            .bind()
+            .await
+            .unwrap();
+        b.online().await;
+        let addr = iroh_base::EndpointAddr::from_parts(
+            b.id(),
+            [
+                iroh_base::TransportAddr::Relay(relay_url),
+                iroh_base::TransportAddr::Custom(to_custom_addr(b.id())),
+            ],
+        );
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let (client, server) = tokio::join!(a.connect(addr.clone(), b"ping"), async {
+                b.accept().await.unwrap().await.unwrap()
+            });
+            clients.push(client.unwrap());
+            servers.push(server);
+        }
+        let paths = time::timeout(Duration::from_secs(10), async {
+            loop {
+                scripted.selected.notified().await;
+                let paths = scripted.paths.lock().unwrap().clone();
+                let mut ready = FxHashMap::<usize, (bool, bool)>::default();
+                for (conn, _, p_addr) in &paths {
+                    let entry = ready.entry(conn.stable_id()).or_default();
+                    entry.0 |= p_addr.is_relay();
+                    entry.1 |= matches!(p_addr, transports::FourTuple::Custom { .. });
+                }
+                if ready.len() == 2 && ready.values().all(|p| p.0 && p.1) {
+                    break paths;
+                }
+            }
+        })
+        .await
+        .expect("both connections have validated relay and custom paths");
+
+        let target_stable_id = clients[0].stable_id();
+        let other_stable_id = clients[1].stable_id();
+        assert_ne!(target_stable_id, other_stable_id);
+        let target_conn = paths
+            .iter()
+            .find_map(|(c, _, _)| (c.stable_id() == target_stable_id).then(|| c.clone()))
+            .expect("first client connection present in selector snapshot");
+        let other_conn = paths
+            .iter()
+            .find_map(|(c, _, _)| (c.stable_id() == other_stable_id).then(|| c.clone()))
+            .expect("second client connection present in selector snapshot");
+        *scripted.target_conn_stable_id.lock().unwrap() = Some(target_conn.stable_id());
+        let (_, target_custom_id, target_custom_addr) = paths
+            .iter()
+            .find(|(c, _, p)| {
+                c.stable_id() == target_conn.stable_id()
+                    && matches!(p, transports::FourTuple::Custom { .. })
+            })
+            .unwrap()
+            .clone();
+        let (_, target_relay_id, _) = paths
+            .iter()
+            .find(|(c, _, p)| c.stable_id() == target_conn.stable_id() && p.is_relay())
+            .unwrap();
+
+        let flush_round_trip = async |clients: &[crate::endpoint::Connection],
+                                      servers: &[crate::endpoint::Connection]| {
+            for (client, server) in clients.iter().zip(servers) {
+                client
+                    .send_datagram(bytes::Bytes::from_static(b"sync"))
+                    .unwrap();
+                let data = server.read_datagram().await.unwrap();
+                server.send_datagram(data).unwrap();
+                assert_eq!(client.read_datagram().await.unwrap().as_ref(), b"sync");
+            }
+        };
+
+        // 1. Without PathSelection::ping, a real select_path pass sends zero PING frames.
+        scripted.selected.notified().await;
+        flush_round_trip(&clients, &servers).await;
+        let before_unrequested_0 = target_conn.stats().frame_tx.ping;
+        let before_unrequested_1 = other_conn.stats().frame_tx.ping;
+        let before_custom_samples = target_conn
+            .path_stats(target_custom_id)
+            .unwrap()
+            .same_path_rtt_samples;
+        scripted.selected.notified().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(target_conn.stats().frame_tx.ping, before_unrequested_0);
+        assert_eq!(other_conn.stats().frame_tx.ping, before_unrequested_1);
+        assert_eq!(
+            target_conn
+                .path_stats(target_custom_id)
+                .unwrap()
+                .same_path_rtt_samples,
+            before_custom_samples
+        );
+
+        // 2. Requesting ping (including duplicate calls on the same PathSelectionData in one pass)
+        // sends exactly one PING on that exact connection and path, and zero on the other connection.
+        let before_tx_relay = target_conn
+            .path_stats(*target_relay_id)
+            .unwrap()
+            .udp_tx
+            .datagrams;
+        scripted
+            .ping_custom_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if target_conn
+                    .path_stats(target_custom_id)
+                    .unwrap()
+                    .same_path_rtt_samples
+                    > before_custom_samples
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("single-path ping refreshes same_path_rtt_samples on the requested backup path");
+        assert_eq!(target_conn.stats().frame_tx.ping, before_unrequested_0 + 1);
+        assert_eq!(other_conn.stats().frame_tx.ping, before_unrequested_1);
+        assert_eq!(
+            target_conn
+                .path_stats(*target_relay_id)
+                .unwrap()
+                .udp_tx
+                .datagrams,
+            before_tx_relay,
+            "unrequested relay path on the same connection transmits nothing"
+        );
+
+        // 3. Pinging an already closed path or closed connection does not fail or disrupt live paths.
+        if let Some(path) = target_conn.path(target_custom_id) {
+            let _ = path.close();
+        }
+        other_conn.close(0u32.into(), b"closed");
+        let local = n0_watcher::Watchable::new(BTreeSet::new());
+        let mut actor = RemoteStateActor::new(
+            b.id(),
+            local.watch(),
+            Default::default(),
+            Default::default(),
+            Arc::default(),
+            AddressLookupServices::default(),
+            Arc::new(CapturePaths::default()),
+            false,
+            RelayPolicies::default(),
+        );
+        for conn in [&target_conn, &other_conn] {
+            let (tx, _) = oneshot::channel();
+            actor.handle_msg_add_connection(conn.clone(), tx);
+        }
+        actor
+            .connections
+            .get_mut(&ConnId(target_conn.stable_id()))
+            .unwrap()
+            .paths
+            .insert(target_custom_id, target_custom_addr.clone());
+        let mut closed_selection = PathSelection::none();
+        closed_selection.ping(&PathSelectionData::live(
+            &target_custom_addr,
+            target_custom_id,
+            target_conn.clone(),
+        ));
+        closed_selection.ping(&PathSelectionData::live(
+            &target_custom_addr,
+            target_custom_id,
+            other_conn.clone(),
+        ));
+        actor.ping_paths(&closed_selection);
+        scripted
+            .ping_all_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        scripted.selected.notified().await;
+        clients[0]
+            .send_datagram(bytes::Bytes::from_static(b"after-close"))
+            .unwrap();
+        let data = servers[0].read_datagram().await.unwrap();
+        assert_eq!(data.as_ref(), b"after-close");
+
+        drop(clients);
+        drop(servers);
+        a.close().await;
+        b.close().await;
+    }
+
+    #[test]
+    fn selector_ping_deduplicates_test_targets_without_changing_selection() {
+        let ip = transports::FourTuple::from_remote(transports::Addr::Ip(
+            "127.0.0.1:1234".parse().unwrap(),
+        ));
+        let relay = transports::FourTuple::from_remote(transports::Addr::Relay(
+            "https://relay.example".parse().unwrap(),
+            iroh_base::SecretKey::from_bytes(&[9; 32]).public(),
+        ));
+        let mut selection = PathSelection::none();
+        for addr in [&ip, &ip, &relay] {
+            selection.ping(&PathSelectionData::for_test(addr, None));
+        }
+        assert_eq!(selection.ping.len(), 2);
         assert!(selection.selected().is_none());
     }
 }

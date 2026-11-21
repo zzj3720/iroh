@@ -175,6 +175,8 @@ struct ActiveRelayActor {
     probe_epoch: u64,
     probe_now_tx: watch::Sender<u64>,
     _entry_probes: Option<AbortOnDropHandle<()>>,
+    #[cfg(test)]
+    fixed_probe_rtts: Arc<BTreeMap<RelayUrl, Duration>>,
     /// ember: whether the relay's UDP way is asked for, read at each dial.
     udp: Arc<AtomicBool>,
     /// Whether or not this is the home relay server.
@@ -358,6 +360,8 @@ impl ActiveRelayActor {
             probe_epoch: 0,
             probe_now_tx,
             _entry_probes: None,
+            #[cfg(test)]
+            fixed_probe_rtts: Default::default(),
             udp,
             is_home_relay: false,
             inactive_deadline,
@@ -418,12 +422,23 @@ impl ActiveRelayActor {
         let opts = self.connection_opts.clone();
         let entries_gen = self.entries_gen;
         let mut probe_now_rx = self.probe_now_tx.subscribe();
+        #[cfg(test)]
+        let fixed_probe_rtts = self.fixed_probe_rtts.clone();
         self._entry_probes = Some(AbortOnDropHandle::new(task::spawn(async move {
             loop {
                 let round_epoch = *probe_now_rx.borrow_and_update();
                 let attempts = urls.iter().cloned().map(|url| {
                     let opts = opts.clone();
-                    async move { Self::probe_entry(url, opts).await }
+                    #[cfg(test)]
+                    let fixed_rtt = fixed_probe_rtts.get(&url).copied();
+                    async move {
+                        let sample = Self::probe_entry(url, opts).await;
+                        #[cfg(test)]
+                        if let (Some((url, _)), Some(rtt)) = (&sample, fixed_rtt) {
+                            return Some((url.clone(), rtt));
+                        }
+                        sample
+                    }
                 });
                 let mut pending = FuturesUnorderedBounded::from_iter(attempts);
                 let mut samples = Vec::new();
@@ -3290,6 +3305,7 @@ mod tests {
             let changed_task = changed.clone();
             let task = tokio::spawn(async move {
                 while let Ok((incoming, _)) = listener.accept().await {
+                    let _ = incoming.set_nodelay(true);
                     accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     changed_task.notify_waiters();
                     let target = target.clone();
@@ -3299,6 +3315,7 @@ mod tests {
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         if let Ok(upstream) = tokio::net::TcpStream::connect(target).await {
+                            let _ = upstream.set_nodelay(true);
                             let (mut in_r, mut in_w) = incoming.into_split();
                             let (mut up_r, mut up_w) = upstream.into_split();
                             let c2s = async {
@@ -3432,6 +3449,18 @@ mod tests {
 
     impl EntryProbeRig {
         async fn start(relay_delay_ms: u64, entry_delay_ms: u64) -> Result<Self> {
+            Self::start_inner(relay_delay_ms, entry_delay_ms, None).await
+        }
+
+        async fn start_with_fixed_rtts(relay_rtt: Duration, entry_rtt: Duration) -> Result<Self> {
+            Self::start_inner(0, 0, Some((relay_rtt, entry_rtt))).await
+        }
+
+        async fn start_inner(
+            relay_delay_ms: u64,
+            entry_delay_ms: u64,
+            fixed_rtts: Option<(Duration, Duration)>,
+        ) -> Result<Self> {
             let (_map, upstream_relay, server) = test_utils::run_relay_server().await?;
             let (peer, echo) = start_home_echo_endpoint(upstream_relay.clone());
             let target = format!(
@@ -3474,6 +3503,12 @@ mod tests {
                 .await
                 .std_context("set home relay")?;
             let mut actor = ActiveRelayActor::new(opts);
+            if let Some((relay_rtt, entry_rtt)) = fixed_rtts {
+                actor.fixed_probe_rtts = Arc::new(std::collections::BTreeMap::from([
+                    (relay.url.clone(), relay_rtt),
+                    (entry.url.clone(), entry_rtt),
+                ]));
+            }
             actor.start_entry_probes(inbox_tx.clone());
             let actor_task = AbortOnDropHandle::new(tokio::spawn(
                 actor.run().instrument(info_span!("entry-probe-rig")),
@@ -3910,9 +3945,12 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn entry_probe_noise_only_difference_keeps_backoff_to_300s() -> Result {
-        // `relay` has +5 ms delay (~5.3 ms RTT on loopback) while `entry` has 0 ms (~0.3 ms RTT): >90% faster
-        // relatively, but only ~5 ms absolute difference (< `ENTRY_MIN_GAIN` = 10 ms).
-        let mut rig = EntryProbeRig::start(5, 0).await?;
+        // Every round still runs the full ephemeral TLS probe exchange on both entrances, while pinning
+        // reported samples to 5 ms (`relay`) vs 500 us (`entry`): 90% (>20%) faster relatively, 4.5 ms
+        // (< `ENTRY_MIN_GAIN` = 10 ms) absolute difference, without wall-clock scheduler jitter crossing 10 ms.
+        let mut rig =
+            EntryProbeRig::start_with_fixed_rtts(Duration::from_millis(5), Duration::from_micros(500))
+                .await?;
         let packet = RelaySendItem {
             remote_endpoint: rig.peer,
             url: rig.relay.url.clone(),
